@@ -1445,6 +1445,7 @@ const routes = {
 
   'GET /api/queue': async () => ({
     pending: queueView(),
+    features: { item: true, send: true },
     capacity: lastCapacity,
     pollMs: RETRY_POLL_MS,
     limit: CAPACITY_FALLBACK_LIMIT,

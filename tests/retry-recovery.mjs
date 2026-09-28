@@ -191,6 +191,8 @@ async function run() {
     sessionId: 's1', cwd: WORK, text: 'ordinary-behind', clientTurnId: 'turn-ordinary-behind',
   })
   const queueWithTwo = await api('GET', '/api/queue')
+  check('queue API advertises detail and manual-send support',
+    queueWithTwo.body?.features?.item === true && queueWithTwo.body?.features?.send === true)
   check('ordinary bridge message stays behind earlier deferred work',
     secondQueued.body?.status === 'deferred' && queueWithTwo.body?.pending?.length === 2
       && lines(PROMPT_LOG).length === 1)

@@ -25,6 +25,7 @@ const state = {
   busy: false,
   busySessions: new Set(), // sessionIds with an in-flight prompt (stop button follows the session, not the page)
   queueItems: [],       // persistent deferred prompts from /api/queue
+  queueActionsReady: false, // old host stays readable until it can safely restart
   queueExpanded: new Set(), // queueIds with full text open
   queueFullText: new Map(), // fetched only for expanded queue items
   queueActionPending: new Set(),
@@ -248,7 +249,8 @@ function updateQueueBanner() {
   panel.hidden = items.length === 0
   if (!items.length) return
   const current = items.filter(entry => entry.sessionId === state.active?.sessionId).length
-  $('queueText').textContent = `待处理消息 ${items.length} 条${current ? ` · 当前会话 ${current} 条` : ''}`
+  $('queueText').textContent = `待处理消息 ${items.length} 条${current ? ` · 当前会话 ${current} 条` : ''}${state.queueActionsReady ? '' : ' · 服务端待重启'}`
+  $('queueText').title = state.queueActionsReady ? '' : '当前宿主仍在运行旧版接口；会话空闲并重启后可查看全文和手动重试'
   $('queueToggle').textContent = state.queueCollapsed ? '展开' : '收起'
   $('queueToggle').setAttribute('aria-expanded', String(!state.queueCollapsed))
   $('queueList').hidden = state.queueCollapsed
@@ -264,7 +266,8 @@ function updateQueueBanner() {
     identity.className = 'queue-identity'
     const session = state.sessions.find(s => s.sessionId === entry.sessionId)
       ?? state.archiveRows.find(s => s.sessionId === entry.sessionId)
-    identity.textContent = `${entry.source === 'bridge' ? '协作消息' : '网页消息'} · ${session ? sessionTitle(session.sessionId, session.title) : entry.sessionId}`
+    const source = entry.source === 'bridge' ? '协作消息' : entry.source === 'gui' ? '网页消息' : '待处理消息'
+    identity.textContent = `${source} · ${session ? sessionTitle(session.sessionId, session.title) : entry.sessionId}`
     identity.title = entry.sessionId
     top.append(identity)
     const status = document.createElement('span')
@@ -278,7 +281,8 @@ function updateQueueBanner() {
     const full = state.queueFullText.get(entry.queueId)
     const expanded = state.queueExpanded.has(entry.queueId)
     content.textContent = expanded && full !== undefined ? full : entry.preview || (entry.imageCount ? `图片 ${entry.imageCount} 张` : '空消息')
-    if (!expanded && entry.textLength > (entry.preview?.length ?? 0)) content.textContent += '…'
+    if (!expanded && (entry.textLength > (entry.preview?.length ?? 0)
+      || !state.queueActionsReady && (entry.preview?.length ?? 0) >= 120)) content.textContent += '…'
     row.append(content)
     const meta = document.createElement('div')
     meta.className = 'queue-meta'
@@ -288,7 +292,7 @@ function updateQueueBanner() {
     if (details.length) row.append(meta)
     const actions = document.createElement('div')
     actions.className = 'queue-actions'
-    if (entry.textLength > (entry.preview?.length ?? 0)) {
+    if (state.queueActionsReady && entry.textLength > (entry.preview?.length ?? 0)) {
       actions.append(queueButton(expanded ? '收起全文' : '查看全文', async () => {
         if (expanded) state.queueExpanded.delete(entry.queueId)
         else {
@@ -306,7 +310,7 @@ function updateQueueBanner() {
     if (session?.cwd) actions.append(queueButton('打开会话', () => openSession(session)))
     const pending = state.queueActionPending.has(entry.queueId)
     if (entry.state === 'queued') {
-      actions.append(queueButton('立即重试', () => queueAction(entry.queueId, 'send'), pending))
+      actions.append(queueButton('立即重试', () => queueAction(entry.queueId, 'send'), pending || !state.queueActionsReady))
       actions.append(queueButton('取消排队', () => queueAction(entry.queueId, 'drop'), pending))
     }
     row.append(actions)
@@ -333,6 +337,7 @@ async function refreshQueue() {
   try {
     const data = await api('GET', '/api/queue')
     if (seq !== queueRefreshSeq) return
+    state.queueActionsReady = data.features?.item === true && data.features?.send === true
     state.queueItems = Array.isArray(data.pending) ? data.pending : []
     const ids = new Set(state.queueItems.map(e => e.queueId))
     for (const id of state.queueFullText.keys()) if (!ids.has(id)) { state.queueFullText.delete(id); state.queueExpanded.delete(id) }
@@ -1951,7 +1956,10 @@ function connectEvents() {
   const es = new EventSource('/api/events')
   // SSE means the Lite host is reachable; only ACP initialization proves
   // that Devin itself is connected. Reconnect also revives a missing child.
-  es.onopen = () => { void api('GET', '/api/status').then(s => showAgentOnline(s.agentInfo)).catch(e => showAgentOffline(e.message)) }
+  es.onopen = () => {
+    void api('GET', '/api/status').then(s => showAgentOnline(s.agentInfo)).catch(e => showAgentOffline(e.message))
+    void refreshQueue() // a restarted host may now provide queue detail/actions
+  }
   es.onmessage = (e) => {
     let ev
     try { ev = JSON.parse(e.data) } catch { return }
