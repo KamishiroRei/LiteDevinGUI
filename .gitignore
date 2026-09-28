@@ -3,3 +3,10 @@ node_modules/
 .DS_Store
 Thumbs.db
 probe-*.log
+
+attachments/
+devin-lite.acp.pid
+archived-sessions.json
+archived-sessions.json.corrupt-*
+deferred-prompts.json
+deferred-prompts.json.corrupt-*
