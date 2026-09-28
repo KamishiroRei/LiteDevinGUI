@@ -1,11 +1,11 @@
 ---
 name: codex-thread-communication
-description: Codex 自主判断是否委派；需要 subagent 时优先使用 Devin Lite 单 ACP 入口的 SWE-2 High，并发满则改用 GPT-6 Sol Max；Devin 正常启动后放手，多模态实战验收和动画/特效制作由 GPT-6 执行。
+description: Codex 自主判断是否委派；优先使用 Devin SWE-2 High，并发满时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max；Devin 启动后放手，多模态实战验收和动画/特效制作由 GPT-6 执行。
 ---
 
 # Codex → Devin 协作
 
-用于 Codex 处理用户已授权任务时的自主分工，无需用户另行提出使用 subagent 或执行会话。**有 Devin 名额时把 SWE-2 High 当作 subagent 使用；并发已满时改用 GPT-6 Sol Max，其他工作按正常方式推进。**Codex 继续理解目标、判断方案、执行工作、整合结果、完成必要验证并向用户交付；在规划分工时主动评估协作收益。SWE 在受委派范围内自主完成探查、设计、实现、验证、排错和内部协作。省 token 通过有效委派、适当并行和减少重复检查实现，Codex 仍对整体任务的完成负责。
+用于 Codex 处理用户已授权任务时的自主分工，无需用户另行提出使用 subagent 或执行会话。**有 Devin 名额时把 SWE-2 High 当作 subagent 使用；并发已满时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max，其他工作按正常方式推进。**Codex 继续理解目标、判断方案、执行工作、整合结果、完成必要验证并向用户交付；在规划分工时主动评估协作收益。SWE 在受委派范围内自主完成探查、设计、实现、验证、排错和内部协作。省 token 通过有效委派、适当并行和减少重复检查实现，Codex 仍对整体任务的完成负责。
 
 ## 自主委派判断
 
@@ -13,23 +13,23 @@ description: Codex 自主判断是否委派；需要 subagent 时优先使用 De
 
 ## 模型与适用边界
 
-全局 AGENTS 规定 subagent 路由：用户当次明确指定的模型与职责优先；否则优先通过 Devin CLI 的 SWE-2 High。日常委派由桥梁连接 Devin Lite 持有的单个 `devin acp`，并发已满时使用 Codex 原生 GPT-6 Sol Max subagent。具体模型、容量与额度说明见 [执行者策略](references/executor-policy.md)。
+全局 AGENTS 规定 subagent 路由：用户当次明确指定的模型与职责优先；否则优先通过 Devin CLI 的 SWE-2 High。日常委派由桥梁连接 Devin Lite 持有的单个 `devin acp`，并发已满时按任务难度选择 Codex 原生 GPT-6 Sol Max 或 GPT-6 Luna Max subagent。具体模型、容量与额度说明见 [执行者策略](references/executor-policy.md)。
 
 涉及截图、视频、音频等多模态证据的实战验收，以及动画/特效制作，由 GPT-6 执行。相关问题分析、方案设计、代码和配置实现可交给 SWE-2 High；实现后把可复现步骤、产物位置与待判定表现交回 GPT-6。文字描述、静态检查和编译不能替代视觉或实战证据。
 
 ## 派单与自主协作
 
-有 Devin 名额时，使用 [Devin 会话通讯](../devin-session-collaboration/SKILL.md) 的本地桥梁委派、收结果、续跑与取消。桥梁默认进入当前 Devin Lite 的单 ACP 宿主；Lite 不可达时明确失败，不能静默改用另一套独立 CLI。Devin session ID 与 Codex thread ID 不能混用。满额回退时使用 Codex 原生 subagent，模型参数为 `model: gpt-6-sol`、`reasoning_effort: max`。这里的 subagent 指协作角色，载体由所选路由决定；用户明确要求 Codex 新聊天时才创建该聊天。
+有 Devin 名额时，使用 [Devin 会话通讯](../devin-session-collaboration/SKILL.md) 的本地桥梁委派、收结果、续跑与取消。桥梁默认进入当前 Devin Lite 的单 ACP 宿主；Lite 不可达时明确失败，不能静默改用另一套独立 CLI。Devin session ID 与 Codex thread ID 不能混用。满额回退时使用 Codex 原生 subagent：Sol Max 为 `model: gpt-6-sol`、`reasoning_effort: max`；Luna Max 为 `model: gpt-6-luna`、`reasoning_effort: max`。这里的 subagent 指协作角色，载体由所选路由决定；用户明确要求 Codex 新聊天时才创建该聊天。
 
 Codex 新建 Devin 会话前先确定该任务所属的稳定项目或独立 checkout 根目录，并将它传给桥梁 `start --cwd`；这也是会话在 Devin Lite 等客户端显示的工作区。任务书、桥梁 `--state`、隔离工作目录和产物可位于项目内的任务区，均以绝对路径传递并在任务书中限定读写范围，不能因为本次任务在某个子目录执行就把该子目录当作会话工作区。只有该目录本身确实是独立项目/checkout，或用户明确要求单列工作区，才用它作 `--cwd`。已有会话按其创建时的原始 cwd 续跑；不要为整理侧栏而换 cwd 冒充原会话。具体选择与示例见 [Devin 会话通讯](../devin-session-collaboration/SKILL.md#会话工作区与任务目录)。
 
-委派提示尽量简短：说明目标、已知事实、可用材料和确属硬边界的范围与授权；需要验收时说明可观察结果。实现路径由所选执行者自行判断，SWE-2 High 或满额回退的 GPT-6 Sol Max 都自主执行受委派职责；主控不代写逐工具步骤或逐阶段计划。
+委派提示尽量简短：说明目标、已知事实、可用材料和确属硬边界的范围与授权；需要验收时说明可观察结果。SWE-2 High 和 GPT-6 Sol Max 自主判断执行路径；交给 GPT-6 Luna Max 时，主会话写明执行方法和判定标准，不让 Luna 自行决定方案。
 
 SWE-2 High 按旗舰执行者使用，可自主拆分、联系同任务执行者、建立有收益的子任务、相互咨询、转交任务、评审和排错。协作拓扑随任务调整，执行者可成为某个子目标的组织者；同级交流不必绕经 Codex，也不要求固定树形或逐级审批。这些动作继承原任务授权，无需为每个内部消息再次询问用户。委派不能扩大项目范围、发布权限或付费权限。模型不可用时明确返回条件，不静默更换模型。
 
 默认不安排高频中途检查与纠正，也不要求逐阶段向 GPT-6 报批。执行者自行解决职责内问题；先在获授权的 Devin 同级或子任务间解决，真正需要主控决策、范围外授权或 GPT-6 专长时才升级。必要的过程记录用于恢复和执行者协作，主控无需逐条阅读。
 
-独立任务并行；重叠文件按写入归属串行或隔离。编辑器实例、构建输出、运行端口等共享资源也有负责人。Codex 派发新的 subagent 前按[并发准入正文](../devin-session-collaboration/SKILL.md#swe-并发准入与满额等待)读取 Devin 实际活跃数和上限：有名额才派发 SWE，已满直接改用 GPT-6 Sol Max。桥梁保留对已提交任务的后台等位能力；若预检后因并发竞争进入 `waiting_capacity`，先取消待执行的 SWE 并确认不会再启动，再改派 GPT-6 Sol Max，避免双执行。主控可直接攻坚并保留其他执行者的独立进度。
+独立任务并行；重叠文件按写入归属串行或隔离。编辑器实例、构建输出、运行端口等共享资源也有负责人。Codex 派发新的 subagent 前按[并发准入正文](../devin-session-collaboration/SKILL.md#swe-并发准入与满额等待)读取 Devin 实际活跃数和上限：有名额才派发 SWE，已满按任务难度选择 Sol Max 或 Luna Max。桥梁保留对已提交任务的后台等位能力；若预检后因并发竞争进入 `waiting_capacity`，先取消待执行的 SWE 并确认不会再启动，再改派所选执行者，避免双执行。主控可直接攻坚并保留其他执行者的独立进度。
 
 执行者间的派单、消息、回复与结论均经桥梁记录。SWE→SWE 的普通 `send` 立即入目标邮箱；目标本轮若正用 `wait` 等待该发送者，消息直接作为当前工具调用结果返回，随后 `inbox --read` 即可继续本轮。目标若正在其他工作中，只能在它主动读邮箱时获得消息，无法由发送方自动注入。`--action` 只在接收方当前 Lite/ACP 回合结束后续跑，不能用于当前轮直接引导。Lite GUI 的插话会直接提交同一 session 的新 prompt；已接受发送不等于模型立即应用。需要中途纠偏时按 [Devin 会话通讯](../devin-session-collaboration/SKILL.md) 的现役路径处理；身份、运行状态和结果以桥梁记录、Lite 会话与实际产物为准。
 

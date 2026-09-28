@@ -9,7 +9,7 @@ description: Codex 与 Devin、以及 Devin 内部的自主会话通讯与协作
 
 ## 委派方式
 
-Codex 有 Devin 名额时把 SWE-2 High 当作异步自主 subagent 使用，通过本桥梁调用已经运行的 Devin Lite，由 Lite 的单个 `devin acp` 承载会话；并发已满时改用 GPT-6 Sol Max，具体路由见[当前执行者策略](../codex-thread-communication/references/executor-policy.md)。委派时简短提供目标、已知事实、可用材料和必要边界，执行者自行决定实现路径。Codex 轻量确认任务正常启动、无明显运行故障后即可放手；有其他独立工作照常推进，无事直接结束当前轮进入 idle，不持续监视、反复查询进度或阻塞等待。SWE 自主完成受委派职责，不设轻量模型式逐步检查或逐阶段报批；普通问题与获授权的同级自行解决，完成或真正需要主控处理时再回送。接收方可按分工是 Codex、Devin 同级或组织者，收到后按正常职责整合、验证和交付。
+Codex 有 Devin 名额时把 SWE-2 High 当作异步自主 subagent 使用，通过本桥梁调用已经运行的 Devin Lite，由 Lite 的单个 `devin acp` 承载会话；并发已满时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max，具体路由见[当前执行者策略](../codex-thread-communication/references/executor-policy.md)。给 SWE 委派时简短提供目标、已知事实、可用材料和必要边界，由 SWE 自行决定实现路径；Luna 任务书按 [Codex 协作](../codex-thread-communication/SKILL.md) 给出明确方法和判据。Codex 轻量确认任务正常启动、无明显运行故障后即可放手；有其他独立工作照常推进，无事直接结束当前轮进入 idle，不持续监视、反复查询进度或阻塞等待。SWE 自主完成受委派职责，不设轻量模型式逐步检查或逐阶段报批；普通问题与获授权的同级自行解决，完成或真正需要主控处理时再回送。接收方可按分工是 Codex、Devin 同级或组织者，收到后按正常职责整合、验证和交付。
 
 ## 会话工作区与任务目录
 
@@ -25,9 +25,9 @@ Codex 有 Devin 名额时把 SWE-2 High 当作异步自主 subagent 使用，通
 
 会话内经 `run_subagent` 派生的 subagent **同样各占一个名额**（前台阻塞式与后台异步一样计）。已实测确认：subagent 不产生独立 `devin` 进程、`sessions.db` 会话行或 `/api/sessions` 条目，外部无法枚举，因此实行**派生方自报**：任何会话调用 `run_subagent` 前先跑 `swe_capacity.py` 看总量，满额（含已登记 subagent）不得派生，改为自己执行或推迟；获准启动后立即 `python scripts/swe_subagents.py register --agent <agent_id> --parent <自己的session/actor>`（该命令在同一全局准入锁内重查并原子登记，满额退出码2，`--wait` 按300秒轮询等位）；收到完成通知后 `done --agent <id>`，subagent 长时运行期间择机 `heartbeat`。登记项带 `host_pid` 时宿主进程已死即不计；超过 `DEVIN_SWE_SUBAGENT_TTL`（默认6小时）未保活视为残留不计入但保留待 `sweep` 清理。不可观测不等于不占名额：禁止以不登记绕过上限。
 
-达到上限或新增后将超限，桥梁持久保留已提交的待执行任务并进入`waiting_capacity`。后台执行器**每300秒（5分钟）重新查询运行总量**，有空位时在全局准入锁内重查并启动；没有空位继续等，不能超发或终止他人的任务。等待期间可响应取消，但取消检查不额外轮询容量。查运行数与启动须为同一跨任务互斥操作，避免多个发布者同时占同一空位。Codex 为新任务选择执行者时，在提交前按上限检查；已满则按执行者策略改用 GPT-6 Sol Max，不创建等位的 Devin 执行者。发现已超限时停止新增，等待自然释放。
+达到上限或新增后将超限，桥梁持久保留已提交的待执行任务并进入`waiting_capacity`。后台执行器**每300秒（5分钟）重新查询运行总量**，有空位时在全局准入锁内重查并启动；没有空位继续等，不能超发或终止他人的任务。等待期间可响应取消，但取消检查不额外轮询容量。查运行数与启动须为同一跨任务互斥操作，避免多个发布者同时占同一空位。Codex 为新任务选择执行者时，在提交前按上限检查；已满则按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max，不创建等位的 Devin 执行者。发现已超限时停止新增，等待自然释放。
 
-这是已提交 Devin 任务的异步容量调度，只轮询名额，不高频检查模型进度；Codex 新委派在预检满额时直接选择 GPT-6 Sol Max。对仍在桥梁等位的任务，后台队列负责5分钟复查。父会话需新子任务而无名额时，自行处理或保存状态后释放自身执行轮，避免名额全被等待子任务的父会话占满。
+这是已提交 Devin 任务的异步容量调度，只轮询名额，不高频检查模型进度；Codex 新委派在预检满额时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max。对仍在桥梁等位的任务，后台队列负责5分钟复查。父会话需新子任务而无名额时，自行处理或保存状态后释放自身执行轮，避免名额全被等待子任务的父会话占满。
 
 桥梁每轮启动前调用`scripts/swe_capacity.py`：默认7，`DEVIN_SWE_MAX_CONCURRENCY`仅接受7..10；本机用户LocalAppData下的全局锁跨任务库共享。默认 Lite 路径在锁内调用 `/api/bridge/turn/start`，响应前 Lite 已保留 busy 计数，后续准入扫描将该会话计入；扫描包含归档中仍运行的会话。每轮`capacity.json`记录数量、上限、检查时间及满额时的下次检查时间。只读预检可直接运行该脚本（输出含已登记 subagent 计数与明细），派发仍在锁内重查。不要绕过桥梁直接启动模型以规避名额，也不要靠不登记 subagent 规避名额。
 
