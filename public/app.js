@@ -28,11 +28,13 @@ const state = {
   archiveRows: [],      // server-owned archived session metadata
   archiveReady: false,
   configOptions: [],     // select-type session config options (mode, model, …)
-  echoPending: undefined, // text of the just-sent prompt, for echo suppression
+  pendingEchoes: [], // optimistic prompts awaiting ACP echoes; several can run on one session
+  pendingSends: new Map(), // clientMessageId -> optimistic bubble and draft for precise failure feedback
   earliestTurn: 0,       // first rendered history turn index
   totalTurns: 0,
   loadingEarlier: false,
   attachments: [],        // legacy drafts may still contain attachment tokens
+  imageRefs: [],          // current session's path-backed image mentions
   openSeq: 0,             // increments per session switch; stale async renders bail
   stream: freshStream(),
 }
@@ -123,6 +125,82 @@ function addNote(text, cls = '') {
   $('transcript').appendChild(div)
   scrollBottom()
   return div
+}
+
+const IMAGE_BOOKS_KEY = 'devin-lite:image-refs'
+const IMAGE_PATH_RE = /\.(?:png|jpe?g|gif|webp|bmp|avif)$/i
+const IMAGE_TOKEN_RE = /@图片(\d+)/g
+const imageBooks = new Map()
+try {
+  for (const [sessionId, rows] of JSON.parse(localStorage.getItem(IMAGE_BOOKS_KEY) ?? '[]')) {
+    if (typeof sessionId !== 'string' || !Array.isArray(rows)) continue
+    imageBooks.set(sessionId, rows.filter(r => r && typeof r.path === 'string' && /^图片\d+$/.test(r.label))
+      .map(r => ({ path: r.path, label: r.label, committed: r.committed === true })))
+  }
+} catch { /* malformed old browser state does not block the UI */ }
+
+function imageRefsFor(sessionId) {
+  if (!imageBooks.has(sessionId)) imageBooks.set(sessionId, [])
+  return imageBooks.get(sessionId)
+}
+
+function persistImageRefs() {
+  try {
+    localStorage.setItem(IMAGE_BOOKS_KEY, JSON.stringify([...imageBooks].map(([id, rows]) =>
+      [id, rows.filter(r => r.path).map(({ path, label, committed }) => ({ path, label, committed: committed === true }))])))
+  } catch { /* the current page still keeps the references */ }
+}
+
+function nextImageLabel(rows) {
+  const used = new Set(rows.map(r => Number(r.label.slice(2))))
+  let number = 1
+  while (used.has(number)) number++
+  return `图片${number}`
+}
+
+function registerImagePath(path, sessionId = state.active?.sessionId, committed = false) {
+  if (!sessionId || typeof path !== 'string' || !IMAGE_PATH_RE.test(path)) return null
+  const rows = imageRefsFor(sessionId)
+  let ref = rows.find(r => r.path?.toLowerCase() === path.toLowerCase())
+  if (!ref) {
+    ref = { path, label: nextImageLabel(rows), committed }
+    rows.push(ref)
+    persistImageRefs()
+  } else if (committed && !ref.committed) {
+    ref.committed = true
+    persistImageRefs()
+  }
+  if (state.active?.sessionId === sessionId) {
+    state.imageRefs = rows
+    renderChips()
+  }
+  return ref
+}
+
+function pruneUnusedDraftImages(sessionId, text) {
+  if (!sessionId) return
+  const used = new Set([...text.matchAll(IMAGE_TOKEN_RE)].map(m => `图片${m[1]}`))
+  const rows = imageRefsFor(sessionId)
+  let changed = false
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const ref = rows[i]
+    if (ref.committed || ref.sentPending || used.has(ref.label)) continue
+    ref.removed = true
+    ref.controller?.abort()
+    if (ref.objectUrl) URL.revokeObjectURL(ref.objectUrl)
+    rows.splice(i, 1)
+    changed = true
+  }
+  if (changed) persistImageRefs()
+}
+
+async function refreshSessionImages(sessionId, seq) {
+  try {
+    const res = await api('GET', `/api/session-images?sessionId=${encodeURIComponent(sessionId)}`)
+    if (seq !== state.openSeq) return
+    for (const image of res.images ?? []) registerImagePath(image.path, sessionId, true)
+    // Render paths from history only after the image book is populated.
+  } catch { /* older service versions may not offer image discovery */ }
 }
 
 function toast(text, cls = '') {
@@ -317,10 +395,75 @@ function renderPermission(ev) {
   scrollBottom()
 }
 
+function imagePreviewUrl(ref) {
+  return ref.objectUrl || (ref.path ? `/api/image-preview?path=${encodeURIComponent(ref.path)}` : '')
+}
+
+function hideImagePreview() { $('imageHoverPreview').hidden = true }
+
+function showImagePreview(ref, anchor) {
+  const src = imagePreviewUrl(ref)
+  if (!src) return
+  const preview = $('imageHoverPreview')
+  preview.replaceChildren()
+  const img = document.createElement('img')
+  img.src = src
+  img.alt = ref.label
+  const caption = document.createElement('div')
+  caption.className = 'image-preview-caption'
+  caption.textContent = ref.path ?? `${ref.label} · 正在保存到磁盘`
+  preview.append(img, caption)
+  preview.hidden = false
+  const rect = anchor.getBoundingClientRect()
+  const box = preview.getBoundingClientRect()
+  preview.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - box.width - 8))}px`
+  preview.style.top = `${Math.max(8, Math.min(rect.bottom + 8, window.innerHeight - box.height - 8))}px`
+}
+
+function makeImageChip(ref, composer = false) {
+  const chip = document.createElement('button')
+  chip.type = 'button'
+  chip.className = `image-ref-chip${composer ? ' composer-image-chip' : ''}${ref.pending ? ' pending' : ''}${ref.error ? ' error' : ''}`
+  chip.setAttribute('aria-label', `${ref.label}，悬浮预览图片`)
+  chip.title = ref.error ? `${ref.label} 保存失败：${ref.error}` : (ref.path ?? `${ref.label} 正在保存`)
+  const img = document.createElement('img')
+  img.src = imagePreviewUrl(ref)
+  img.alt = ''
+  const label = document.createElement('span')
+  label.textContent = ref.label
+  chip.append(img, label)
+  chip.addEventListener('pointerenter', () => showImagePreview(ref, chip))
+  chip.addEventListener('pointerleave', hideImagePreview)
+  chip.addEventListener('focus', () => showImagePreview(ref, chip))
+  chip.addEventListener('blur', hideImagePreview)
+  chip.addEventListener('click', () => {
+    if (ref.error && ref.blob) void uploadImageRef(ref)
+    else showImagePreview(ref, chip)
+  })
+  return chip
+}
+
 function renderRefText(span, text) {
-  // Keep path references and the words around them exactly as sent. A compact
-  // chip can accidentally swallow adjacent Chinese prose such as “.pvf来理解”.
-  span.textContent = text
+  // Only known image paths become chips. Other paths and surrounding prose
+  // remain exact text, including a path immediately followed by Chinese.
+  const refs = state.imageRefs.filter(r => r.path).sort((a, b) => b.path.length - a.path.length)
+  const lower = text.toLowerCase()
+  let cursor = 0
+  while (cursor < text.length) {
+    let found = null
+    for (const ref of refs) {
+      let at = lower.indexOf(ref.path.toLowerCase(), cursor)
+      while (at >= 0 && /[\w.\\/]/.test(text[at + ref.path.length] ?? '')) {
+        at = lower.indexOf(ref.path.toLowerCase(), at + 1)
+      }
+      if (at >= 0 && (!found || at < found.at || (at === found.at && ref.path.length > found.ref.path.length))) found = { at, ref }
+    }
+    if (!found) break
+    if (found.at > cursor) span.appendChild(document.createTextNode(text.slice(cursor, found.at)))
+    span.appendChild(makeImageChip(found.ref))
+    cursor = found.at + found.ref.path.length
+  }
+  if (cursor < text.length) span.appendChild(document.createTextNode(text.slice(cursor)))
 }
 
 /**
@@ -429,14 +572,14 @@ function handleUpdate(ev) {
   let u = ev.update
   applyMetaUpdate(u)
   if (u.sessionUpdate === 'user_message_chunk' && u.content?.type === 'text') {
-    const echoBuf = (state.stream.echoBuf ?? '') + u.content.text
-    if (state.echoPending !== undefined && state.echoPending.startsWith(echoBuf)) {
-      state.stream.echoBuf = echoBuf
-      if (echoBuf === state.echoPending) { state.echoPending = undefined; state.stream.echoBuf = '' }
-      return // devin echoed our prompt back
+    for (const pending of state.pendingEchoes) {
+      if (pending.sessionId !== ev.sessionId) continue
+      const next = pending.buf + u.content.text
+      if (!pending.text.startsWith(next)) continue
+      pending.buf = next
+      if (next === pending.text) state.pendingEchoes.splice(state.pendingEchoes.indexOf(pending), 1)
+      return // devin echoed an optimistic prompt back
     }
-    state.stream.echoBuf = ''
-    if (echoBuf !== u.content.text) u = { ...u, content: { ...u.content, text: echoBuf } }
   }
   renderUpdate(u, state.stream, $('transcript'))
   scrollBottom()
@@ -924,8 +1067,11 @@ function setActive(session, configOptions) {
   state.totalTurns = 0
   state.loadingEarlier = false
   state.attachments = []
-  state.echoPending = undefined
+  state.imageRefs = imageRefsFor(session.sessionId)
+  state.pendingEchoes = state.pendingEchoes.filter(pending => pending.sessionId !== session.sessionId)
   state.openSeq++
+  hideMentionMenu()
+  hideImagePreview()
   renderChips()
   $('transcript').innerHTML = ''
   typingEl = null
@@ -948,6 +1094,11 @@ function clearActive() {
   state.active = undefined
   localStorage.removeItem('devin-lite:active')
   state.stream = freshStream()
+  state.imageRefs = []
+  state.attachments = []
+  hideMentionMenu()
+  hideImagePreview()
+  renderChips()
   showEmptyState()
   $('chatTitle').textContent = '开始使用 Devin Lite'
   $('chatId').textContent = ''
@@ -969,6 +1120,8 @@ async function openSession(s) {
     const res = await api('POST', '/api/sessions/load', { sessionId: s.sessionId, cwd: s.cwd })
     if (seq !== state.openSeq) return // superseded by a newer switch
     if (res.configOptions) { state.configOptions = res.configOptions; renderOptionBar() }
+    await refreshSessionImages(s.sessionId, seq)
+    if (seq !== state.openSeq) return
     await renderHistoryTail()
   } catch (err) {
     if (seq !== state.openSeq) return
@@ -1092,8 +1245,11 @@ function loadDraft(sessionId) {
 
 let draftSaveTimer
 $('input').addEventListener('input', () => {
-  clearTimeout(draftSaveTimer)
   const sessionId = state.active?.sessionId
+  pruneUnusedDraftImages(sessionId, $('input').value)
+  renderChips()
+  updateMentionMenu()
+  clearTimeout(draftSaveTimer)
   if (sessionId) draftSaveTimer = setTimeout(() => {
     if (state.active?.sessionId === sessionId) saveDraft(sessionId)
   }, 250)
@@ -1118,7 +1274,12 @@ function insertAtCursor(value) {
 
 function insertPaths(paths) {
   const list = paths.filter(p => typeof p === 'string' && p !== '')
-  if (list.length > 0) insertAtCursor(list.join('\n'))
+  if (list.length > 0) insertAtCursor(list.map(p => pathAsComposerText(p, state.active?.sessionId)).join('\n'))
+}
+
+function pathAsComposerText(path, sessionId) {
+  const ref = registerImagePath(path, sessionId)
+  return ref ? `@${ref.label}` : path
 }
 
 // Native clipboard/file-picker calls are asynchronous. A marker anchors the
@@ -1132,9 +1293,10 @@ function beginPathInsert() {
   return { sessionId, marker }
 }
 
-function finishPathInsert(pending, paths, error) {
+function finishPathInsert(pending, paths, error, replacementOverride) {
   if (!pending) return
-  const replacement = (paths ?? []).filter(p => typeof p === 'string' && p !== '').join('\n')
+  const replacement = replacementOverride ?? (paths ?? []).filter(p => typeof p === 'string' && p !== '')
+    .map(p => pathAsComposerText(p, pending.sessionId)).join('\n')
   const ta = $('input')
   if (state.active?.sessionId === pending.sessionId) {
     const at = ta.value.indexOf(pending.marker)
@@ -1157,28 +1319,103 @@ function finishPathInsert(pending, paths, error) {
   if (!replacement && error) toast(error, 'error')
 }
 
-async function stageImageDataUrl(dataUrl, pending) {
-  try {
-    const res = await api('POST', '/api/attach', { dataUrl })
-    if (typeof res.path !== 'string' || !res.path) throw new Error('未返回磁盘路径')
-    finishPathInsert(pending, [res.path])
-  } catch (err) {
-    finishPathInsert(pending, [], `图片保存失败：${err.message}`)
+function replaceSessionToken(sessionId, oldToken, newToken) {
+  const pattern = new RegExp(`${oldToken}(?!\\d)`, 'g')
+  if (state.active?.sessionId === sessionId) {
+    const ta = $('input')
+    const start = ta.value.slice(0, ta.selectionStart).replace(pattern, newToken).length
+    const end = ta.value.slice(0, ta.selectionEnd).replace(pattern, newToken).length
+    ta.value = ta.value.replace(pattern, newToken)
+    ta.selectionStart = start; ta.selectionEnd = end
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+  } else {
+    const draft = drafts.get(sessionId)
+    if (draft) { draft.text = draft.text.replace(pattern, newToken); persistDrafts() }
   }
 }
 
-async function stageImageFile(file, pending) {
-  try {
-    const dataUrl = await new Promise((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onload = () => resolve(reader.result)
-      reader.onerror = () => reject(reader.error ?? new Error('读取图片失败'))
-      reader.readAsDataURL(file)
-    })
-    await stageImageDataUrl(dataUrl, pending)
-  } catch (err) {
-    finishPathInsert(pending, [], `图片读取失败：${err.message}`)
+function beginImageRef(blob, pending) {
+  if (!pending) return null
+  const rows = imageRefsFor(pending.sessionId)
+  const ref = { label: nextImageLabel(rows), blob, objectUrl: URL.createObjectURL(blob), pending: true, sessionId: pending.sessionId }
+  rows.push(ref)
+  finishPathInsert(pending, [], undefined, `@${ref.label}`)
+  if (state.active?.sessionId === pending.sessionId) renderChips()
+  return ref
+}
+
+function completeImageRef(ref, path, keepLocalPreview = false) {
+  if (ref.removed) return
+  const rows = imageRefsFor(ref.sessionId)
+  const existing = rows.find(r => r !== ref && r.path?.toLowerCase() === path.toLowerCase())
+  if (existing) {
+    replaceSessionToken(ref.sessionId, `@${ref.label}`, `@${existing.label}`)
+    rows.splice(rows.indexOf(ref), 1)
+  } else {
+    ref.path = path
+    ref.pending = false
+    ref.error = undefined
+    ref.blob = undefined
   }
+  if (existing || !keepLocalPreview) {
+    if (ref.objectUrl) URL.revokeObjectURL(ref.objectUrl)
+    ref.objectUrl = undefined
+  }
+  persistImageRefs()
+  if (state.active?.sessionId === ref.sessionId) renderChips()
+}
+
+async function uploadImageRef(ref) {
+  if (!ref?.blob || ref.removed || (ref.pending && ref.uploading)) return
+  ref.pending = true
+  ref.uploading = true
+  ref.controller = new AbortController()
+  ref.error = undefined
+  if (state.active?.sessionId === ref.sessionId) renderChips()
+  try {
+    const response = await fetch('/api/attach', {
+      method: 'POST', headers: { 'Content-Type': ref.blob.type || 'image/png' }, body: ref.blob,
+      signal: ref.controller.signal,
+    })
+    let result = await response.json().catch(() => ({}))
+    let legacyService = false
+    if (!response.ok && /invalid JSON body/i.test(result.error ?? '')) {
+      // A browser may have refreshed before its long-lived local server was
+      // restarted. Keep this one compatibility attempt for that old process.
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(reader.result)
+        reader.onerror = () => reject(reader.error ?? new Error('图片读取失败'))
+        reader.readAsDataURL(ref.blob)
+      })
+      result = await api('POST', '/api/attach', { dataUrl })
+      legacyService = true
+    } else if (!response.ok) throw new Error(result.error ?? `${response.status}`)
+    if (typeof result.path !== 'string' || !result.path) throw new Error('未返回磁盘路径')
+    completeImageRef(ref, result.path, legacyService)
+  } catch (err) {
+    if (ref.removed || err.name === 'AbortError') return
+    ref.pending = false
+    ref.error = err.message
+    toast(`图片保存失败：${err.message}（点击图片可重试）`, 'error')
+    if (state.active?.sessionId === ref.sessionId) renderChips()
+  } finally {
+    ref.uploading = false
+    ref.controller = undefined
+  }
+}
+
+async function stageImageDataUrl(dataUrl, pending) {
+  try {
+    const blob = await (await fetch(dataUrl)).blob()
+    const ref = beginImageRef(blob, pending)
+    if (ref) await uploadImageRef(ref)
+  } catch (err) { finishPathInsert(pending, [], `图片读取失败：${err.message}`) }
+}
+
+async function stageImageFile(file, pending) {
+  const ref = beginImageRef(file, pending)
+  if (ref) await uploadImageRef(ref)
 }
 
 function addPathRef(path) { insertPaths([path]) }
@@ -1197,10 +1434,19 @@ function droppedPaths(e) {
   return [...new Set(out)]
 }
 
+let lastChipsSignature = ''
 function renderChips() {
+  const labels = new Set([...$('input').value.matchAll(IMAGE_TOKEN_RE)].map(m => `图片${m[1]}`))
+  const visibleRefs = [...labels].map(label => state.imageRefs.find(ref => ref.label === label)).filter(Boolean)
+  const signature = JSON.stringify([
+    state.active?.sessionId,
+    state.attachments.map(a => [a.name, a.path, a.kind]),
+    visibleRefs.map(r => [r.label, r.path, r.objectUrl, r.pending, r.error]),
+  ])
+  if (signature === lastChipsSignature) return
+  lastChipsSignature = signature
   const row = $('attachChips')
   row.innerHTML = ''
-  row.hidden = state.attachments.length === 0
   state.attachments.forEach((a, i) => {
     const chip = document.createElement('span')
     const visual = a.kind === 'image' && a.dataUrl // restored drafts keep path only
@@ -1223,6 +1469,98 @@ function renderChips() {
     })
     row.appendChild(chip)
   })
+  for (const ref of visibleRefs) {
+    const wrap = document.createElement('span')
+    wrap.className = 'image-chip-wrap'
+    wrap.appendChild(makeImageChip(ref, true))
+    const remove = document.createElement('button')
+    remove.type = 'button'
+    remove.className = 'image-chip-remove'
+    remove.textContent = '×'
+    remove.title = `移除 ${ref.label} 引用`
+    remove.addEventListener('click', () => {
+      replaceSessionToken(state.active.sessionId, `@${ref.label}`, '')
+      renderChips()
+      $('input').focus()
+    })
+    wrap.appendChild(remove)
+    row.appendChild(wrap)
+  }
+  row.hidden = row.childElementCount === 0
+}
+
+let mentionContext = null
+function hideMentionMenu() {
+  mentionContext = null
+  $('imageMentionMenu').hidden = true
+}
+
+function updateMentionMenu() {
+  const ta = $('input')
+  if (!state.active || ta.selectionStart !== ta.selectionEnd) { hideMentionMenu(); return }
+  const before = ta.value.slice(0, ta.selectionStart)
+  const match = /@([^\s@]{0,32})$/.exec(before)
+  if (!match || /^图片\d+$/.test(match[1])) { hideMentionMenu(); return }
+  const query = match[1].toLowerCase()
+  const refs = state.imageRefs.filter(ref => {
+    const name = ref.path?.split(/[\\/]/).pop() ?? ''
+    return ref.path && (!query || ref.label.includes(query) || name.toLowerCase().includes(query))
+  })
+  if (!refs.length) { hideMentionMenu(); return }
+  const menu = $('imageMentionMenu')
+  menu.replaceChildren()
+  const start = ta.selectionStart - match[0].length
+  mentionContext = { sessionId: state.active.sessionId, start, end: ta.selectionStart, refs, index: 0 }
+  for (const [index, ref] of refs.entries()) {
+    const item = document.createElement('button')
+    item.type = 'button'
+    item.className = `image-mention-item${index === 0 ? ' active' : ''}`
+    item.setAttribute('role', 'option')
+    item.setAttribute('aria-selected', index === 0 ? 'true' : 'false')
+    const img = document.createElement('img')
+    img.src = imagePreviewUrl(ref)
+    img.alt = ''
+    const label = document.createElement('span')
+    label.className = 'image-mention-label'
+    const strong = document.createElement('strong')
+    strong.textContent = ref.label
+    const small = document.createElement('small')
+    small.textContent = ref.path.split(/[\\/]/).pop()
+    label.append(strong, small)
+    item.append(img, label)
+    item.addEventListener('pointerenter', () => showImagePreview(ref, item))
+    item.addEventListener('pointerleave', hideImagePreview)
+    item.addEventListener('mousedown', e => e.preventDefault())
+    item.addEventListener('click', () => selectMention(index))
+    menu.appendChild(item)
+  }
+  menu.hidden = false
+}
+
+function moveMention(delta) {
+  if (!mentionContext) return
+  mentionContext.index = (mentionContext.index + delta + mentionContext.refs.length) % mentionContext.refs.length
+  $('imageMentionMenu').querySelectorAll('.image-mention-item').forEach((item, i) => {
+    const active = i === mentionContext.index
+    item.classList.toggle('active', active)
+    item.setAttribute('aria-selected', String(active))
+    if (active) item.scrollIntoView({ block: 'nearest' })
+  })
+}
+
+function selectMention(index = mentionContext?.index) {
+  const context = mentionContext
+  if (!context || state.active?.sessionId !== context.sessionId) return
+  const ref = context.refs[index]
+  if (!ref) return
+  const ta = $('input')
+  const before = ta.value[context.start - 1] ?? ''
+  const after = ta.value[context.end] ?? ''
+  const token = `${before && !/\s/.test(before) ? ' ' : ''}@${ref.label}${after && /\s/.test(after) ? '' : ' '}`
+  ta.setRangeText(token, context.start, context.end, 'end')
+  ta.dispatchEvent(new Event('input', { bubbles: true }))
+  hideMentionMenu()
+  ta.focus()
 }
 
 function clipboardPathsMatchFiles(paths, files) {
@@ -1250,21 +1588,29 @@ $('input').addEventListener('paste', async (e) => {
     if (pending) await stageImageDataUrl(src, pending)
     return
   }
+  if (files.length === 0 && !html && /^(?:[A-Za-z]:[\\/]|\\\\).+\.(?:png|jpe?g|gif|webp|bmp|avif)$/i.test(plain.trim())) {
+    e.preventDefault()
+    insertPaths([plain.trim()])
+    return
+  }
   if (files.length === 0 && (plain || html)) return // ordinary clipboard content, including a typed path
   e.preventDefault()
   const pending = beginPathInsert()
   if (!pending) return
+  const imageRef = files.length === 1 && /^image\/(?:png|jpeg|gif|webp|bmp|avif)$/.test(files[0].type)
+    ? beginImageRef(files[0], pending) : null
   // Explorer file objects have their real path in CF_HDROP, even when the
   // browser only exposes a nameless File. This works for any file extension.
   try {
     const res = await api('POST', '/api/clipboard-files')
     if (res.paths?.length && clipboardPathsMatchFiles(res.paths, files)) {
-      finishPathInsert(pending, res.paths)
+      if (imageRef && res.paths.length === 1) completeImageRef(imageRef, res.paths[0])
+      else finishPathInsert(pending, res.paths)
       return
     }
   } catch { /* image clipboard can still be staged below */ }
-  if (files.length === 1 && files[0].type.startsWith('image/')) {
-    await stageImageFile(files[0], pending)
+  if (imageRef) {
+    await uploadImageRef(imageRef)
   } else if (src?.startsWith('data:image/')) {
     await stageImageDataUrl(src, pending)
   } else {
@@ -1297,13 +1643,13 @@ $('attachBtn').addEventListener('click', async () => {
 // ---------------------------------------------------------------------------
 
 async function send() {
-  if (state.active && state.busySessions.has(state.active.sessionId)) return
   if ($('input').value.includes('⟦正在读取文件路径 ')) {
     toast('正在读取文件路径，请稍候', 'warn')
     return
   }
   if (!state.active) return
   const sessionId = state.active.sessionId
+  const wasBusy = state.busySessions.has(sessionId)
   const cwd = state.active.cwd
   const rawText = $('input').value.trim()
   const atts = [...state.attachments]
@@ -1321,52 +1667,75 @@ async function send() {
     const a = atts.find(x => x.name === name.trim())
     return a?.path ?? m
   })
+  let missingImage = ''
+  text = text.replace(IMAGE_TOKEN_RE, (token, number, offset, source) => {
+    const ref = state.imageRefs.find(r => r.label === `图片${number}`)
+    if (!ref?.path) { missingImage = ref?.pending ? `${ref.label} 正在保存` : `${ref?.label ?? token} 没有可用的磁盘路径`; return token }
+    const before = source[offset - 1] ?? ''
+    const after = source[offset + token.length] ?? ''
+    return `${before && !/\s/.test(before) ? ' ' : ''}${ref.path}${after && !/\s/.test(after) ? ' ' : ''}`
+  })
+  if (missingImage) { toast(`${missingImage}，请等待或重新粘贴`, 'warn'); return }
   const unused = atts.filter(a => a.path && !rawText.includes(`{{${a.name}}}`)).map(a => a.path)
   if (unused.length > 0) text = [text, `附加文件：\n${unused.join('\n')}`].filter(Boolean).join('\n\n')
   if (!text) return
-  state.lastSent = { text: rawText, atts }
+  const sentRefs = [...new Set([...rawText.matchAll(IMAGE_TOKEN_RE)].map(m => `图片${m[1]}`))]
+    .map(label => imageRefsFor(sessionId).find(ref => ref.label === label)).filter(Boolean)
+  for (const ref of sentRefs) ref.sentPending = true
+  const clientMessageId = globalThis.crypto?.randomUUID?.() ?? `ui-${Date.now()}-${Math.random().toString(36).slice(2)}`
   $('input').value = ''
+  hideMentionMenu()
   state.attachments = []
   drafts.delete(sessionId)
   persistDrafts()
   renderChips()
-  state.echoPending = text
-  state.stream.echoBuf = ''
+  state.pendingEchoes.push({ id: clientMessageId, sessionId, text, buf: '' })
   // Optimistic user bubble, visually separated from the previous turn. Only
   // The optimistic echo shows exactly the text and paths sent to Devin.
   if ($('transcript').childElementCount > 0) turnSep($('transcript'), undefined, state.stream)
   else closeRun(state.stream, 'sep')
   renderUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } }, state.stream, $('transcript'))
+  state.pendingSends.set(clientMessageId, {
+    sessionId, text: rawText, atts, expanded: text, bubble: state.stream.userEl?.parentElement,
+  })
   scrollBottom()
   state.busySessions.add(sessionId)
   setBusy(true)
   try {
-    const res = await api('POST', '/api/prompt', { sessionId, cwd, text })
+    const res = await api('POST', '/api/prompt', { sessionId, cwd, text, clientMessageId })
+    for (const ref of sentRefs) { ref.sentPending = false; ref.committed = true }
+    if (sentRefs.length) persistImageRefs()
     // Queued behind the shared concurrency budget: not running, not failed —
     // the bubble stays and the prompt-dispatch event announces the retry.
     if (res?.deferred) {
-      state.busySessions.delete(sessionId)
-      if (state.active?.sessionId === sessionId) setBusy(false)
+      if (!wasBusy) {
+        state.busySessions.delete(sessionId)
+        if (state.active?.sessionId === sessionId) setBusy(false)
+      }
       void refreshQueue()
     }
   } catch (err) {
-    state.busySessions.delete(sessionId)
-    if (state.active?.sessionId === sessionId) setBusy(false)
-    toast(`发送失败：${err.message}`, 'error')
-    // Put the draft back — a failed send must not swallow the message.
-    drafts.set(sessionId, { text: rawText, attachments: atts })
-    persistDrafts()
-    if (state.active?.sessionId !== sessionId) return
-    $('input').value = rawText
-    state.attachments = atts
-    renderChips()
-    // And roll back the optimistic bubble if nothing arrived after it.
-    const ue = state.stream.userEl?.parentElement
-    if (ue && $('transcript').lastElementChild === ue) {
-      const prev = ue.previousElementSibling
-      ue.remove()
-      if (prev?.classList.contains('turn-sep')) prev.remove()
+    state.pendingEchoes = state.pendingEchoes.filter(pending => pending.id !== clientMessageId)
+    for (const ref of sentRefs) ref.sentPending = false
+    if (!wasBusy) {
+      state.busySessions.delete(sessionId)
+      if (state.active?.sessionId === sessionId) setBusy(false)
     }
+    toast(`发送失败：${err.message}`, 'error')
+    // Restore this exact failed message without replacing text typed while
+    // its request was in flight; other concurrent bubbles stay untouched.
+    const current = state.active?.sessionId === sessionId ? $('input').value : drafts.get(sessionId)?.text ?? ''
+    const restored = [rawText, current].filter(Boolean).join('\n\n')
+    if (state.active?.sessionId === sessionId) {
+      $('input').value = restored
+      state.attachments = [...atts, ...state.attachments]
+      renderChips()
+    }
+    drafts.set(sessionId, { text: restored, attachments: atts })
+    persistDrafts()
+    const pendingSend = state.pendingSends.get(clientMessageId)
+    if (pendingSend) pendingSend.restored = true
+    if (state.active?.sessionId === sessionId) markUserFailed(clientMessageId)
   }
 }
 
@@ -1375,23 +1744,28 @@ async function send() {
  * draft (text + attachments) and removes the bubble. If devin already
  * committed the message this is view-level only; it reappears on reload.
  */
-function markLastUserFailed() {
+function markUserFailed(clientMessageId) {
+  const pending = clientMessageId ? state.pendingSends.get(clientMessageId)
+    : [...state.pendingSends.values()].reverse().find(entry => entry.sessionId === state.active?.sessionId && !entry.failed)
+  if (clientMessageId && (!pending || pending.sessionId !== state.active?.sessionId || !pending.bubble?.isConnected)) return
   const bubbles = $('transcript').querySelectorAll('.msg.user')
-  const ue = bubbles[bubbles.length - 1]
+  const ue = pending?.bubble?.isConnected ? pending.bubble : bubbles[bubbles.length - 1]
   if (!ue || ue.querySelector('.undo-btn')) return
+  if (pending) pending.failed = true
   ue.classList.add('failed')
   const btn = document.createElement('button')
   btn.className = 'undo-btn'
   btn.textContent = '↩ 撤回'
   btn.title = '恢复到输入框重新发送（如 devin 已提交该消息，撤回仅移除本地显示）'
   btn.addEventListener('click', () => {
-    if (state.lastSent) {
-      $('input').value = state.lastSent.text
-      state.attachments = state.lastSent.atts
-      state.lastSent = undefined
+    if (pending && !pending.restored) {
+      $('input').value = [pending.text, $('input').value].filter(Boolean).join('\n\n')
+      state.attachments = [...pending.atts, ...state.attachments]
       renderChips()
       $('input').focus()
+      saveDraft(pending.sessionId)
     }
+    if (clientMessageId) state.pendingSends.delete(clientMessageId)
     const prev = ue.previousElementSibling
     ue.remove()
     if (prev?.classList.contains('turn-sep')) prev.remove()
@@ -1404,7 +1778,7 @@ function setBusy(on) {
   state.busy = on
   $('busyBadge').hidden = !on
   $('stopBtn').hidden = !on
-  $('sendBtn').disabled = on || !state.active
+  $('sendBtn').disabled = !state.active
   if (on) {
     if (!typingEl?.isConnected) { // send() and the busy SSE both call setBusy(true)
       typingEl = document.createElement('div')
@@ -1412,6 +1786,7 @@ function setBusy(on) {
       typingEl.innerHTML = '<i></i><i></i><i></i><span>devin 正在处理</span>'
       $('transcript').appendChild(typingEl)
     }
+    else if ($('transcript').lastElementChild !== typingEl) $('transcript').appendChild(typingEl)
     scrollBottom()
   } else {
     typingEl?.remove()
@@ -1450,10 +1825,9 @@ function connectEvents() {
       case 'permission': if (ev.sessionId === state.active?.sessionId) renderPermission(ev); break
       case 'permission-done': state.stream.permEls.get(ev.requestId)?.remove(); state.stream.permEls.delete(ev.requestId); break
       case 'prompt-deferred': {
-        state.busySessions.delete(ev.sessionId)
         const row = state.sessions.find(s => s.sessionId === ev.sessionId)
-        if (row) row._busy = false
-        if (ev.sessionId === state.active?.sessionId) setBusy(false)
+        if (row) row._busy = state.busySessions.has(ev.sessionId)
+        if (ev.sessionId === state.active?.sessionId) setBusy(state.busySessions.has(ev.sessionId))
         const when = typeof ev.waitSeconds === 'number' && ev.waitSeconds > 0 ? `约 ${ev.waitSeconds} 秒后重发` : '空位恢复后自动发送'
         toast(`消息已排队（第 ${ev.position} 位）· ${when}`, 'warn')
         void refreshQueue()
@@ -1466,14 +1840,14 @@ function connectEvents() {
         break
       }
       case 'prompt-done': {
-        state.busySessions.delete(ev.sessionId)
         void refreshQueue()
+        state.pendingEchoes = state.pendingEchoes.filter(pending => ev.clientMessageId
+          ? pending.id !== ev.clientMessageId : pending.sessionId !== ev.sessionId)
+        if (!ev.error && ev.clientMessageId) state.pendingSends.delete(ev.clientMessageId)
         if (ev.sessionId !== state.active?.sessionId) break
-        setBusy(false)
-        // Turn settled — a stale echo token must not swallow future echoes.
-        state.echoPending = undefined
-        state.stream.echoBuf = ''
-        if (ev.error) { addNote(`回合失败：${ev.error}`, 'error'); markLastUserFailed() }
+        void refreshSessionImages(ev.sessionId, state.openSeq)
+        setBusy(state.busySessions.has(ev.sessionId))
+        if (ev.error) { addNote(`回合失败：${ev.error}`, 'error'); markUserFailed(ev.clientMessageId) }
         else if (ev.stopReason && ev.stopReason !== 'end_turn') addNote(`回合结束：${ev.stopReason}`, 'warn')
         break
       }
@@ -1527,7 +1901,7 @@ if (localStorage.getItem('devin-lite:sidebar-collapsed') === '1') {
 // Click the usage badge to force compaction — devin exposes /compact as a
 // slash command, so it rides the normal prompt path as a visible message.
 $('usageBadge').addEventListener('click', () => {
-  if (!state.active || state.busySessions.has(state.active.sessionId)) return
+  if (!state.active) return
   $('input').value = '/compact'
   send()
 })
@@ -1535,7 +1909,18 @@ $('stopBtn').addEventListener('click', () => {
   if (state.active) api('POST', '/api/cancel', { sessionId: state.active.sessionId }).catch(() => {})
 })
 $('input').addEventListener('keydown', (e) => {
+  if (mentionContext && !$('imageMentionMenu').hidden && !e.isComposing) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveMention(1); return }
+    if (e.key === 'ArrowUp') { e.preventDefault(); moveMention(-1); return }
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); selectMention(); return }
+    if (e.key === 'Escape') { e.preventDefault(); hideMentionMenu(); return }
+  }
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send() }
+})
+$('input').addEventListener('click', updateMentionMenu)
+$('input').addEventListener('keyup', e => { if (e.key.startsWith('Arrow') || e.key === 'Home' || e.key === 'End') updateMentionMenu() })
+document.addEventListener('pointerdown', e => {
+  if (!e.target.closest('#composer')) { hideMentionMenu(); hideImagePreview() }
 })
 $('newBtn').addEventListener('click', () => newSession())
 $('reloadBtn').addEventListener('click', () => { void Promise.all([refreshSessions(), refreshArchives()]) })

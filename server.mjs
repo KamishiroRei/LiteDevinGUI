@@ -11,7 +11,7 @@
 import http from 'node:http'
 import { spawn, execFileSync } from 'node:child_process'
 import { createInterface } from 'node:readline'
-import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync, unlinkSync, renameSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync, unlinkSync, renameSync, openSync, readSync, closeSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve, isAbsolute, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -57,7 +57,7 @@ const PROBE_AFTER_MS = Math.min(3_600_000, Math.max(60_000, Number(process.env.D
 const QUEUE_FILE = join(ROOT, 'deferred-prompts.json')
 const CONCURRENCY_RE = new RegExp(
   process.env.DEVIN_LITE_CONCURRENCY_RE
-  ?? 'concurren|rate.?limit|too many|429|resource.?exhaust|quota|usage.?limit|capacity|insufficient.{0,12}(quota|capacity|fund|balance)',
+  ?? 'concurren|rate.?limit|too many|too.{0,5}quick|429|resource.?exhaust|quota|usage.?limit|capacity|insufficient.{0,12}(quota|capacity|fund|balance)',
   'i')
 
 /** IDE-host env markers that break `devin acp` when inherited. */
@@ -90,14 +90,16 @@ class DevinAcp {
   histories = new Map()
   /** sessionIds mid-replay: their updates buffer instead of broadcasting. */
   loading = new Set()
-  /** Sessions with a session/prompt currently in flight in this process. */
-  busy = new Set()
+  /** sessionId -> in-flight session/prompt count (interjections share a session). */
+  busy = new Map()
   /**
-   * sessionId -> { text, buf, images } for the just-sent prompt. Sent messages
-   * are pushed into the history buffer immediately; devin's live echo of them
-   * (when it comes) is suppressed here so a reload neither loses the message
-   * nor shows it twice — suppression must live server-side to survive the
-   * client switching sessions mid-turn.
+   * sessionId -> FIFO of { text, buf, images } suppression records, one per
+   * in-flight prompt. Sent messages are pushed into the history buffer
+   * immediately; devin's live echo of them (when it comes) is suppressed here
+   * so a reload neither loses the message nor shows it twice — suppression
+   * must live server-side to survive the client switching sessions mid-turn.
+   * A queue, not a single record: interjecting into a running session keeps
+   * two prompts in flight and each needs its own suppression.
    */
   echoPending = new Map()
   listeners = new Set()
@@ -129,6 +131,15 @@ class DevinAcp {
     if (!this.inbound.delete(requestId)) return false
     this.send({ jsonrpc: '2.0', id: requestId, result })
     return true
+  }
+
+  /** Drop one echo-suppression record; forget the session when none remain. */
+  dropEcho(sessionId, rec) {
+    const echos = this.echoPending.get(sessionId)
+    if (echos === undefined) return
+    const i = echos.indexOf(rec)
+    if (i >= 0) echos.splice(i, 1)
+    if (echos.length === 0) this.echoPending.delete(sessionId)
   }
 
   /** Devin Desktop credential store supplies the key authenticate() accepts. */
@@ -267,23 +278,35 @@ class DevinAcp {
       const params = message.params
       let update = params.update
       // Swallow devin's live echo of a prompt we already buffered synthetically.
-      const ep = this.echoPending.get(params.sessionId)
-      if (ep !== undefined && update.sessionUpdate === 'user_message_chunk') {
+      const echos = this.echoPending.get(params.sessionId)
+      if (echos !== undefined && update.sessionUpdate === 'user_message_chunk') {
         const t = update.content?.type
-        if (t === 'image' && ep.images > 0) {
-          ep.images--
-          if (ep.images === 0 && ep.buf === ep.text) this.echoPending.delete(params.sessionId)
-          return
-        }
-        if (t === 'text' && ep.buf.length < ep.text.length) {
-          ep.buf += update.content.text
-          if (ep.text.startsWith(ep.buf)) {
-            if (ep.buf === ep.text && ep.images === 0) this.echoPending.delete(params.sessionId)
+        if (t === 'image') {
+          const ep = echos.find(e => e.images > 0)
+          if (ep !== undefined) {
+            ep.images--
+            if (ep.images === 0 && ep.buf === ep.text) this.dropEcho(params.sessionId, ep)
             return
           }
-          // Diverged: not our echo — emit the accumulated text as one chunk.
-          this.echoPending.delete(params.sessionId)
-          update = { ...update, content: { ...update.content, text: ep.buf } }
+        }
+        if (t === 'text') {
+          const chunk = update.content.text ?? ''
+          // Attribute the chunk to whichever in-flight prompt it continues —
+          // echoes of interleaved same-session prompts do not arrive in order.
+          const ep = echos.find(e => e.buf.length < e.text.length && e.text.startsWith(e.buf + chunk))
+          if (ep !== undefined) {
+            ep.buf += chunk
+            if (ep.buf === ep.text && ep.images === 0) this.dropEcho(params.sessionId, ep)
+            return
+          }
+          // No pending prompt accepts this chunk. If a record accumulated a
+          // partial echo that now diverges, surface it merged with the chunk
+          // rather than losing either side.
+          const stuck = echos.find(e => e.buf.length > 0)
+          if (stuck !== undefined) {
+            this.dropEcho(params.sessionId, stuck)
+            update = { ...update, content: { ...update.content, text: stuck.buf + chunk } }
+          }
         }
       }
       const history = this.histories.get(params.sessionId)
@@ -306,6 +329,20 @@ class DevinAcp {
 
   onAgentRequest(message) {
     if (message.method === 'session/request_permission') {
+      // Bridge 'bypass' sessions auto-approve — the ACP equivalent of the
+      // CLI's --permission-mode dangerous. GUI sessions keep the manual flow.
+      if (autoApproveSessions.has(message.params?.sessionId)) {
+        const options = Array.isArray(message.params.options) ? message.params.options : []
+        const pick = options.find(o =>
+          /allow|always|approve|accept|yes/i.test(`${o.optionId ?? ''} ${o.name ?? ''} ${o.kind ?? ''}`))
+          ?? options[0]
+        const result = pick === undefined
+          ? { outcome: { outcome: 'cancelled' } }
+          : { outcome: { outcome: 'selected', optionId: pick.optionId } }
+        this.send({ jsonrpc: '2.0', id: message.id, result })
+        this.emit({ kind: 'permission-auto', sessionId: message.params.sessionId, optionId: pick?.optionId, toolCall: message.params.toolCall })
+        return
+      }
       this.inbound.set(message.id, message.params)
       this.emit({ kind: 'permission', requestId: message.id, ...message.params })
       return
@@ -343,7 +380,7 @@ class DevinAcp {
     return created
   }
 
-  async prompt(sessionId, cwd, text, images = [], commit = true) {
+  async prompt(sessionId, cwd, text, images = [], commit = true, echo) {
     await this.ensureLoaded(sessionId, cwd)
     // Commit the sent message to history immediately — whether or not devin
     // echoes it back, the message must exist in the buffer for reloads.
@@ -358,7 +395,12 @@ class DevinAcp {
         history.updates.push({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } })
       }
     }
-    this.echoPending.set(sessionId, { text, buf: '', images: images.length })
+    // Caller may own the suppression record (dispatchPrompt) so settling one
+    // prompt doesn't strip a sibling interjection's suppression.
+    const rec = echo ?? { text, buf: '', images: images.length }
+    const echos = this.echoPending.get(sessionId) ?? []
+    echos.push(rec)
+    this.echoPending.set(sessionId, echos)
     const prompt = [
       ...images.map(img => ({ type: 'image', data: img.data, mimeType: img.mimeType })),
       ...(text.trim() === '' ? [] : [{ type: 'text', text }]),
@@ -474,6 +516,64 @@ function readBody(req) {
     req.on('error', reject)
   })
 }
+
+// ---------------------------------------------------------------------------
+// Local image staging & preview
+// ---------------------------------------------------------------------------
+// Shared size cap for image upload (POST /api/attach) and preview reads
+// (GET /api/image-preview). Bodies buffer fully before any file is written,
+// so an over-cap or invalid upload never leaves a partial file behind.
+const IMAGE_BYTES_CAP = 25 * 1024 * 1024
+const ATTACH_DIR = join(ROOT, 'attachments')
+const ATTACH_EXT = {
+  'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif',
+  'image/webp': '.webp', 'image/bmp': '.bmp', 'image/avif': '.avif',
+  'image/svg+xml': '.svg',
+}
+const IMAGE_MIME = {
+  png: 'image/png', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', bmp: 'image/bmp', avif: 'image/avif',
+}
+
+/** Raster magic-byte detector — type comes from content, never the name. */
+function sniffImageKind(buf) {
+  if (buf.length >= 12) {
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'png'
+    if (buf.toString('latin1', 4, 8) === 'ftyp' && /^avi[fs]/.test(buf.toString('latin1', 8, 12))) return 'avif'
+    if (buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP') return 'webp'
+  }
+  if (buf.length >= 6 && /^GIF8[79]a/.test(buf.toString('latin1', 0, 6))) return 'gif'
+  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpeg'
+  if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return 'bmp'
+  return undefined
+}
+
+/** Collect a raw request body with a hard byte cap (no partial-file risk). */
+function readRawBody(req, cap) {
+  return new Promise((resolvePromise, reject) => {
+    const chunks = []
+    let total = 0
+    // Over-cap bodies are drained and discarded — destroying the socket would
+    // reset the connection before the 413 response could be written.
+    req.on('data', (chunk) => {
+      total += chunk.length
+      if (total <= cap) chunks.push(chunk)
+    })
+    req.on('end', () => {
+      if (total > cap) return reject(httpError(413, 'image too large'))
+      resolvePromise(Buffer.concat(chunks))
+    })
+    req.on('error', reject)
+  })
+}
+
+/**
+ * Windows absolute raster-image path inside message text. Path segments may
+ * contain spaces and CJK (both legal in NTFS names); the match ends at the
+ * image extension and refuses to extend through `.` or a word char, so
+ * "a.png这张" / "a.png.txt" / "a.pngx" behave correctly.
+ */
+const RASTER_PATH_RE = /[A-Za-z]:[\\/](?:[^<>:"|?*\\/\r\n]+[\\/])*[^<>:"|?*\\/\r\n]*?\.(?:png|jpe?g|gif|webp|bmp|avif)(?![\w.])/gi
 
 function requireDir(value) {
   if (typeof value !== 'string' || !isAbsolute(value)) throw Object.assign(new Error('cwd must be an absolute path'), { status: 400 })
@@ -640,7 +740,14 @@ function deferPrompt(entry, reason, retryAfterMs) {
     kind: 'prompt-deferred', sessionId: entry.sessionId, queueId: entry.queueId,
     position, reason: entry.lastError, attempts: entry.attempts,
     retryAt: new Date(entry.retryAt).toISOString(), waitSeconds,
+    ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}),
   })
+  if (entry.turnId !== undefined) {
+    const turn = bridgeTurns.get(entry.turnId)
+    if (turn !== undefined) {
+      turnSet(turn, 'deferred', { queueId: entry.queueId, retryAt: entry.retryAt, lastError: entry.lastError, attempts: entry.attempts })
+    }
+  }
   log(`deferred prompt for ${entry.sessionId} (queue ${deferred.length}, retry in ${waitSeconds}s): ${entry.lastError}`)
   schedulePump()
 }
@@ -658,18 +765,37 @@ function removeQueued(entry) {
 async function dispatchPrompt(entry) {
   const { sessionId } = entry
   entry.state = 'sending'
-  acp.busy.add(sessionId)
-  acp.emit({ kind: 'busy', sessionId, busy: true })
-  const settle = () => { acp.busy.delete(sessionId); acp.echoPending.delete(sessionId); acp.emit({ kind: 'busy', sessionId, busy: false }) }
+  // Refcounted busy: a session stays "running" until its LAST in-flight
+  // prompt settles — an early-finishing interjection must not expose the
+  // still-running sibling to the capacity gate or the queue pump.
+  const inflight = (acp.busy.get(sessionId) ?? 0) + 1
+  acp.busy.set(sessionId, inflight)
+  if (inflight === 1) acp.emit({ kind: 'busy', sessionId, busy: true })
+  // This dispatch's own echo-suppression record — settle removes only it,
+  // never a sibling interjection still in flight on the same session.
+  const ep = { text: entry.text, buf: '', images: entry.images.length }
+  const settle = () => {
+    const n = (acp.busy.get(sessionId) ?? 1) - 1
+    if (n <= 0) acp.busy.delete(sessionId); else acp.busy.set(sessionId, n)
+    acp.dropEcho(sessionId, ep)
+    if (n <= 0) acp.emit({ kind: 'busy', sessionId, busy: false })
+  }
   try {
     // Commit the user message to the history buffer up front — committed
     // stays truthful however the send then fails (even pre-request), so a
     // re-deferred entry never duplicates or loses its transcript row.
     commitDeferred(entry)
-    const response = await acp.prompt(sessionId, entry.cwd, entry.text, entry.images, !entry.committed)
+    const response = await acp.prompt(sessionId, entry.cwd, entry.text, entry.images, !entry.committed, ep)
     settle()
     removeQueued(entry)
-    acp.emit({ kind: 'prompt-done', sessionId, stopReason: response.stopReason, usage: response.usage })
+    acp.emit({
+      kind: 'prompt-done', sessionId, stopReason: response.stopReason, usage: response.usage,
+      ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}),
+    })
+    if (entry.turnId !== undefined) {
+      const turn = bridgeTurns.get(entry.turnId)
+      if (turn !== undefined) turnSet(turn, 'done', { stopReason: response.stopReason, usage: response.usage })
+    }
     void pumpDeferred() // the freed slot may release this session's next queued prompt
   } catch (error) {
     settle()
@@ -681,7 +807,15 @@ async function dispatchPrompt(entry) {
       return
     }
     removeQueued(entry)
-    acp.emit({ kind: 'prompt-done', sessionId, error: String(error.message ?? error), code: error.code })
+    const message = String(error.message ?? error)
+    acp.emit({
+      kind: 'prompt-done', sessionId, error: message, code: error.code,
+      ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}),
+    })
+    if (entry.turnId !== undefined) {
+      const turn = bridgeTurns.get(entry.turnId)
+      if (turn !== undefined) turnSet(turn, 'error', { error: message, code: error.code })
+    }
     void pumpDeferred()
   }
 }
@@ -742,7 +876,14 @@ async function pumpDeferred() {
       }
       entry.attempts++
       entry.lastAttemptAt = Date.now()
-      acp.emit({ kind: 'prompt-dispatch', sessionId: entry.sessionId, queueId: entry.queueId, attempt: entry.attempts })
+      acp.emit({
+        kind: 'prompt-dispatch', sessionId: entry.sessionId, queueId: entry.queueId, attempt: entry.attempts,
+        ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}),
+      })
+      if (entry.turnId !== undefined) {
+        const turn = bridgeTurns.get(entry.turnId)
+        if (turn !== undefined) turnSet(turn, 'running', { attempts: entry.attempts, retryAt: undefined, queueId: undefined, lastError: undefined })
+      }
       log(`dispatching deferred prompt for ${entry.sessionId} (attempt ${entry.attempts})`)
       void dispatchPrompt(entry)
     }
@@ -758,6 +899,83 @@ deferred = loadQueue()
 if (deferred.length > 0) {
   log(`restored ${deferred.length} deferred prompt(s) from queue file`)
   schedulePump()
+}
+
+// ---------------------------------------------------------------------------
+// Bridge turns: synchronous-to-completion HTTP contract for devin_bridge
+// ---------------------------------------------------------------------------
+// A turn is the REST equivalent of one `devin --print [--resume]` invocation:
+// created by POST /api/bridge/turn/start, tracked through dispatch → deferred
+// → done/error/cancelled. Turn state is deliberately process-memory only:
+// after a server restart an unknown turnId returns 404 so the bridge marks
+// the outcome uncertain instead of silently duplicating work.
+let bridgeTurnSeq = 0
+/** turnId -> turn record */
+const bridgeTurns = new Map()
+/** client-supplied idempotency key -> turnId */
+const clientTurnIds = new Map()
+/** Sessions whose permission requests are auto-answered (bridge 'bypass'). */
+const autoApproveSessions = new Set()
+
+const TURN_TERMINAL = new Set(['done', 'error', 'cancelled'])
+
+function newBridgeTurn({ clientTurnId, sessionId }) {
+  const turn = {
+    turnId: `bt-${Date.now()}-${++bridgeTurnSeq}`,
+    clientTurnId, sessionId,
+    status: 'running', attempts: 0,
+    queueId: undefined, retryAt: undefined, lastError: undefined,
+    stopReason: undefined, usage: undefined, error: undefined, code: undefined,
+    createdAt: Date.now(), finishedAt: undefined,
+    waiters: new Set(),
+  }
+  bridgeTurns.set(turn.turnId, turn)
+  if (clientTurnId !== undefined) clientTurnIds.set(clientTurnId, turn.turnId)
+  // Bound memory: drop the oldest finished turns past 500 tracked.
+  if (bridgeTurns.size > 500) {
+    for (const [id, t] of bridgeTurns) {
+      if (TURN_TERMINAL.has(t.status)) bridgeTurns.delete(id)
+      if (bridgeTurns.size <= 500) break
+    }
+  }
+  return turn
+}
+
+function turnSet(turn, status, patch = {}) {
+  if (TURN_TERMINAL.has(turn.status)) return // terminal is final — a late
+  // resolution after cancel must not resurrect the turn's status
+  Object.assign(turn, patch, { status })
+  if (TURN_TERMINAL.has(status)) turn.finishedAt ??= Date.now()
+  acp.emit({ kind: 'bridge-turn', turnId: turn.turnId, sessionId: turn.sessionId, status })
+  for (const wake of turn.waiters) wake()
+}
+
+function turnView(turn) {
+  return {
+    turnId: turn.turnId,
+    ...(turn.clientTurnId !== undefined ? { clientTurnId: turn.clientTurnId } : {}),
+    sessionId: turn.sessionId,
+    status: turn.status,
+    attempts: turn.attempts,
+    pendingWaiters: turn.waiters.size,
+    ...(turn.queueId !== undefined ? { queueId: turn.queueId } : {}),
+    ...(turn.retryAt !== undefined ? { retryAt: new Date(turn.retryAt).toISOString() } : {}),
+    ...(turn.lastError != null ? { lastError: turn.lastError } : {}),
+    ...(turn.stopReason !== undefined ? { stopReason: turn.stopReason } : {}),
+    ...(turn.usage !== undefined ? { usage: turn.usage } : {}),
+    ...(turn.error !== undefined ? { error: turn.error, code: turn.code } : {}),
+    createdAt: new Date(turn.createdAt).toISOString(),
+    ...(turn.finishedAt !== undefined ? { finishedAt: new Date(turn.finishedAt).toISOString() } : {}),
+  }
+}
+
+/** Mark live turns of a session cancelled (session-level cancel/delete/drop). */
+function cancelTurnsForSession(sessionId) {
+  for (const turn of bridgeTurns.values()) {
+    if (turn.sessionId === sessionId && !TURN_TERMINAL.has(turn.status)) {
+      turnSet(turn, 'cancelled')
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -938,6 +1156,8 @@ const routes = {
     const dropped = deferred.length
     deferred = deferred.filter(e => e.sessionId !== sessionId)
     if (deferred.length !== dropped) { saveQueue(); acp.emit({ kind: 'queue', pending: deferred.length }) }
+    cancelTurnsForSession(sessionId)
+    autoApproveSessions.delete(sessionId)
     if (archived[sessionId] !== undefined) {
       delete archived[sessionId]
       saveArchive()
@@ -966,7 +1186,7 @@ const routes = {
 
   'POST /api/prompt': async (req) => {
     await acp.ensure()
-    const { sessionId, cwd, text, images } = await readBody(req)
+    const { sessionId, cwd, text, images, clientMessageId } = await readBody(req)
     const imgs = Array.isArray(images)
       ? images.filter(i => typeof i?.data === 'string' && typeof i?.mimeType === 'string').slice(0, 8)
       : []
@@ -974,30 +1194,156 @@ const routes = {
       throw httpError(400, 'sessionId and text or images required')
     }
     const dir = requireDir(cwd)
-    const entry = { sessionId, cwd: dir, text: text ?? '', images: imgs, committed: false, attempts: 0, queuedAt: Date.now(), lastError: null, state: 'queued' }
-    // A session's prompts keep send order: anything queued (including one
-    // mid-retry) or a turn already in flight means this prompt waits in line.
-    if (deferred.some(e => e.sessionId === sessionId)) {
-      deferPrompt(entry, 'queued behind earlier deferred prompt')
-      return { deferred: true, queueId: entry.queueId, position: deferred.indexOf(entry) + 1 }
-    }
-    if (acp.busy.has(sessionId)) {
-      deferPrompt(entry, 'queued behind in-flight turn')
-      return { deferred: true, queueId: entry.queueId, position: deferred.indexOf(entry) + 1 }
-    }
-    // Local capacity gate — best effort. An unreadable check submits anyway;
-    // the agent's own concurrency rejection re-defers through the same queue.
-    const cap = await capacitySnapshot()
-    lastCapacity = cap === null ? { error: 'capacity check failed', at: Date.now() } : cap
-    if (cap !== null && cap.active >= cap.limit) {
-      deferPrompt(entry, `capacity full (${cap.active}/${cap.limit})`)
-      return { deferred: true, queueId: entry.queueId, position: deferred.length, capacity: cap }
+    const entry = { sessionId, cwd: dir, text: text ?? '', images: imgs, committed: false, attempts: 0, queuedAt: Date.now(), lastError: null, state: 'queued', clientMessageId }
+    // Interjection: a session with a turn already in flight hands the new user
+    // message straight to the agent — it rides the slot the running turn
+    // already holds, so neither the deferred queue, the busy flag, nor the
+    // capacity check may park it. An authoritative rejection still lands in
+    // the deferred queue via dispatchPrompt (honest, not fake-interjected).
+    if (!acp.busy.has(sessionId)) {
+      // A session's prompts keep send order: anything queued (including one
+      // mid-retry) means this prompt waits in line behind it.
+      if (deferred.some(e => e.sessionId === sessionId)) {
+        deferPrompt(entry, 'queued behind earlier deferred prompt')
+        return { deferred: true, queueId: entry.queueId, position: deferred.indexOf(entry) + 1 }
+      }
+      // Local capacity gate — best effort. An unreadable check submits anyway;
+      // the agent's own concurrency rejection re-defers through the same queue.
+      const cap = await capacitySnapshot()
+      lastCapacity = cap === null ? { error: 'capacity check failed', at: Date.now() } : cap
+      if (cap !== null && cap.active >= cap.limit) {
+        deferPrompt(entry, `capacity full (${cap.active}/${cap.limit})`)
+        return { deferred: true, queueId: entry.queueId, position: deferred.length, capacity: cap }
+      }
     }
     // The prompt resolves when the turn ends — potentially minutes later.
     // Answer immediately and report the outcome over SSE instead.
     entry.attempts++
     void dispatchPrompt(entry)
     return { started: true }
+  },
+
+  /**
+   * Bridge turn contract — the REST equivalent of `devin --print [--resume]`.
+   * start: new or load the session, apply model + mode (defaults swe-2-high /
+   * bypass = CLI's dangerous), mark the session auto-approve, then dispatch on
+   * the same resident acp. The response is only sent after the busy refcount
+   * is up, so the bridge can admit inside its global capacity lock.
+   * clientTurnId is an idempotency key: repeating it returns the same turn.
+   */
+  'POST /api/bridge/turn/start': async (req) => {
+    const { sessionId: requestedSid, cwd, text, images, model, modeId, clientTurnId, clientMessageId } = await readBody(req)
+    if (typeof clientTurnId === 'string' && clientTurnIds.has(clientTurnId)) {
+      const turn = bridgeTurns.get(clientTurnIds.get(clientTurnId))
+      if (turn !== undefined) return { ...turnView(turn), deduped: true }
+      clientTurnIds.delete(clientTurnId)
+    }
+    const dir = requireDir(cwd)
+    const imgs = Array.isArray(images)
+      ? images.filter(i => typeof i?.data === 'string' && typeof i?.mimeType === 'string').slice(0, 8)
+      : []
+    if (typeof text !== 'string' || (text.trim() === '' && imgs.length === 0)) throw httpError(400, 'text or images required')
+    const modelId = typeof model === 'string' && model !== '' ? model : 'swe-2-high'
+    const mode = typeof modeId === 'string' && modeId !== '' ? modeId : 'bypass'
+    await acp.ensure()
+    let created
+    if (typeof requestedSid === 'string' && requestedSid !== '') {
+      created = { ...(await acp.ensureLoaded(requestedSid, dir) ?? {}), sessionId: requestedSid }
+    } else {
+      created = await acp.newSession(dir)
+    }
+    const sessionId = created.sessionId
+    // Model evidence: the agent's own configOptions is the honest proof level
+    // (a selected value, not a per-generation model_name like CLI --export).
+    const cfgOptions = Array.isArray(created.configOptions) ? created.configOptions : []
+    const modelOpt = cfgOptions.find(o => o?.id === 'model' || o?.category === 'model')
+    if (Array.isArray(modelOpt?.options) && !modelOpt.options.some(o => o?.value === modelId)) {
+      throw httpError(422, `model not offered by this agent: ${modelId}`)
+    }
+    const setResult = await acp.request('session/set_config_option', { sessionId, configId: 'model', value: modelId })
+    await acp.request('session/set_mode', { sessionId, modeId: mode })
+    autoApproveSessions.add(sessionId)
+    // Read the model evidence AFTER the set succeeded: if the agent echoes
+    // updated configOptions their currentValue is the honest post-set value;
+    // otherwise the accepted set-request is the strongest proof available.
+    const postCfg = Array.isArray(setResult?.configOptions) ? setResult.configOptions : []
+    const postModelOpt = postCfg.find(o => o?.id === 'model' || o?.category === 'model')
+    const observedModel = postModelOpt?.currentValue ?? modelId
+    const modelEvidence = postModelOpt?.currentValue !== undefined ? 'session-config-option' : 'set-request'
+    const turn = newBridgeTurn({ clientTurnId, sessionId })
+    const entry = {
+      sessionId, cwd: dir, text, images: imgs, committed: false, attempts: 0,
+      queuedAt: Date.now(), lastError: null, state: 'queued',
+      turnId: turn.turnId, clientMessageId,
+    }
+    entry.attempts++
+    turn.attempts = entry.attempts
+    void dispatchPrompt(entry)
+    return {
+      turnId: turn.turnId, sessionId,
+      observedModel, modelEvidence,
+      mode, status: 'running', busy: acp.busy.get(sessionId) ?? 0,
+      ...(clientMessageId !== undefined ? { clientMessageId } : {}),
+      ...(typeof clientTurnId === 'string' ? { clientTurnId } : {}),
+    }
+  },
+
+  /**
+   * Poll a bridge turn, optionally long-polling up to ~30s for the next state
+   * change. Unknown turnId is 404 — turns are memory-only, so after a restart
+   * the bridge must treat the outcome as uncertain, never assume silent loss.
+   */
+  'GET /api/bridge/turn/status': async (_req, query) => {
+    const turn = bridgeTurns.get(query.get('turnId') ?? '')
+    if (turn === undefined) throw httpError(404, 'unknown turnId')
+    if (!TURN_TERMINAL.has(turn.status)) {
+      const waitMs = Math.min(30_000, Math.max(0, Number(query.get('waitMs') ?? 0) || 0))
+      if (waitMs > 0) {
+        await new Promise((resolvePromise) => {
+          // Self-removing: both timeout and wake must clean the waiter out of
+          // the Set or long-running turns accumulate dead callbacks.
+          const done = () => { clearTimeout(timer); turn.waiters.delete(done); resolvePromise() }
+          const timer = setTimeout(done, waitMs)
+          turn.waiters.add(done)
+        })
+      }
+    }
+    return turnView(turn)
+  },
+
+  /**
+   * Cancel one bridge turn. A merely-deferred turn only loses its own queued
+   * retry — no session-level cancel. An in-flight turn needs session/cancel,
+   * which aborts EVERY in-flight prompt of that session: if other prompts are
+   * running alongside (e.g. a GUI interjection), refuse with 409 and keep the
+   * turn running rather than kill work we do not own.
+   */
+  'POST /api/bridge/turn/cancel': async (req) => {
+    const { turnId } = await readBody(req)
+    const turn = bridgeTurns.get(turnId)
+    if (turn === undefined) throw httpError(404, 'unknown turnId')
+    if (TURN_TERMINAL.has(turn.status)) return turnView(turn)
+    if (turn.status === 'running') {
+      const sessionBusy = acp.busy.get(turn.sessionId) ?? 0
+      const others = Math.max(0, sessionBusy - 1) // ours contributes exactly one
+      if (others > 0) {
+        throw httpError(409,
+          `session has ${others} other in-flight prompt(s); refusing session-level cancel`,
+          { conflict: true, sessionBusy, ...turnView(turn) })
+      }
+      const before = deferred.length
+      deferred = deferred.filter(e => e.turnId !== turn.turnId)
+      if (deferred.length !== before) { saveQueue(); acp.emit({ kind: 'queue', pending: deferred.length }) }
+      acp.notify('session/cancel', { sessionId: turn.sessionId })
+      turnSet(turn, 'cancelled')
+      return turnView(turn)
+    }
+    // deferred: this turn is not in flight — drop only its own queued retry.
+    const before = deferred.length
+    deferred = deferred.filter(e => e.turnId !== turn.turnId)
+    if (deferred.length !== before) { saveQueue(); acp.emit({ kind: 'queue', pending: deferred.length }) }
+    turnSet(turn, 'cancelled')
+    return turnView(turn)
   },
 
   'GET /api/queue': async () => ({
@@ -1025,6 +1371,12 @@ const routes = {
     if (deferred.length !== before) {
       saveQueue()
       acp.emit({ kind: 'queue', pending: deferred.length })
+      if (queueId !== undefined) {
+        // A dropped bridge-turn retry cancels the turn itself.
+        for (const turn of bridgeTurns.values()) {
+          if (turn.queueId === queueId && !TURN_TERMINAL.has(turn.status)) turnSet(turn, 'cancelled')
+        }
+      }
     }
     return { removed: before - deferred.length, pending: deferred.length }
   },
@@ -1037,6 +1389,7 @@ const routes = {
     const dropped = deferred.length
     deferred = deferred.filter(e => e.sessionId !== sessionId)
     if (deferred.length !== dropped) { saveQueue(); acp.emit({ kind: 'queue', pending: deferred.length }) }
+    cancelTurnsForSession(sessionId)
     return { ok: true }
   },
 
@@ -1061,19 +1414,92 @@ const routes = {
   /**
    * Stage a pasted image to a local file so prompts can reference it by path
    * instead of embedding bytes — keeps image payloads out of the conversation.
+   * Two wire forms: a raw binary body with `Content-Type: image/*` (skips the
+   * FileReader→base64→JSON round-trip) and the legacy JSON `{dataUrl}`.
+   * Raster bodies are magic-byte verified against the declared type; an
+   * over-cap or type-mismatched upload is rejected before any file exists.
    */
   'POST /api/attach': async (req) => {
+    const mime = String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase()
+    if (mime.startsWith('image/')) {
+      const ext = ATTACH_EXT[mime]
+      if (ext === undefined) throw httpError(415, `unsupported image type: ${mime}`)
+      const buf = await readRawBody(req, IMAGE_BYTES_CAP)
+      if (buf.length === 0) throw httpError(400, 'empty image body')
+      if (mime !== 'image/svg+xml' && IMAGE_MIME[sniffImageKind(buf)] !== mime) {
+        throw httpError(415, 'body is not the declared image type')
+      }
+      mkdirSync(ATTACH_DIR, { recursive: true })
+      const file = join(ATTACH_DIR, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
+      writeFileSync(file, buf)
+      return { path: file }
+    }
     const { dataUrl } = await readBody(req)
     const m = /^data:(image\/[\w.+-]+);base64,(.+)$/.exec(dataUrl ?? '')
     if (!m) throw httpError(400, 'image dataUrl required')
     const buf = Buffer.from(m[2], 'base64')
-    if (buf.length > 25 * 1024 * 1024) throw httpError(400, 'image too large')
-    const dir = join(ROOT, 'attachments')
-    mkdirSync(dir, { recursive: true })
-    const ext = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp', 'image/bmp': '.bmp', 'image/svg+xml': '.svg' }[m[1]] ?? '.img'
-    const file = join(dir, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
+    if (buf.length > IMAGE_BYTES_CAP) throw httpError(400, 'image too large')
+    mkdirSync(ATTACH_DIR, { recursive: true })
+    const ext = ATTACH_EXT[m[1]] ?? '.img'
+    const file = join(ATTACH_DIR, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
     writeFileSync(file, buf)
     return { path: file }
+  },
+
+  /**
+   * Raw bytes of a local raster image for thumbnail rendering. The path must
+   * be absolute, an existing regular file within the size cap, and actually
+   * sniff as a supported raster type — SVG/markup never passes (same-origin
+   * script execution risk). Response is nosniff + CSP 'none'.
+   */
+  'GET /api/image-preview': async (_req, query) => {
+    const raw = query.get('path')
+    if (typeof raw !== 'string' || !isAbsolute(raw)) throw httpError(400, 'absolute path required')
+    const resolved = resolve(raw)
+    let st
+    try { st = statSync(resolved) } catch { throw httpError(404, 'not found') }
+    if (!st.isFile()) throw httpError(404, 'not a regular file')
+    if (st.size === 0 || st.size > IMAGE_BYTES_CAP) throw httpError(413, 'image size out of range')
+    const buf = readFileSync(resolved)
+    const kind = sniffImageKind(buf)
+    if (kind === undefined) throw httpError(415, 'not a supported raster image')
+    return { __raw: buf, contentType: IMAGE_MIME[kind] }
+  },
+
+  /**
+   * Local raster-image paths mentioned in a loaded session's chat text —
+   * user and assistant message bodies only (never tool-call output), deduped
+   * in first-appearance order, filtered to files that still exist. Images
+   * that only ever traveled as base64 have no local path and are skipped.
+   */
+  'GET /api/session-images': async (_req, query) => {
+    const sid = query.get('sessionId') ?? ''
+    const history = acp.histories.get(sid)
+    if (history === undefined) throw httpError(404, 'session not loaded in this process')
+    const seen = new Set()
+    const images = []
+    for (const u of history.updates) {
+      if (u.sessionUpdate !== 'user_message_chunk' && u.sessionUpdate !== 'agent_message_chunk') continue
+      const text = u.content?.text
+      if (typeof text !== 'string') continue
+      for (const m of text.matchAll(RASTER_PATH_RE)) {
+        const p = resolve(m[0])
+        const key = p.toLowerCase()
+        if (seen.has(key)) continue
+        try {
+          if (!statSync(p).isFile()) continue
+          // Head-bytes sniff: a non-raster file merely named *.png is skipped.
+          const fd = openSync(p, 'r')
+          const head = Buffer.alloc(12)
+          const n = readSync(fd, head, 0, 12, 0)
+          closeSync(fd)
+          if (sniffImageKind(head.subarray(0, n)) === undefined) continue
+        } catch { continue }
+        seen.add(key)
+        images.push({ path: p, name: basename(p) })
+      }
+    }
+    return { images }
   },
 
   'POST /api/pick-file': async () => {
@@ -1150,8 +1576,8 @@ const routes = {
   },
 }
 
-function httpError(status, message) {
-  return Object.assign(new Error(message), { status })
+function httpError(status, message, extra) {
+  return Object.assign(new Error(message), { status, extra })
 }
 
 let pickInflight = undefined
@@ -1239,7 +1665,20 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost')
     const handler = routes[`${req.method} ${url.pathname}`]
     if (handler !== undefined) {
-      json(res, 200, await handler(req, url.searchParams))
+      const out = await handler(req, url.searchParams)
+      if (out !== null && typeof out === 'object' && Buffer.isBuffer(out.__raw)) {
+        // Binary payload route (image preview): bytes + sniffed type, with
+        // hardening so the response can't become an executable document.
+        res.writeHead(200, {
+          'Content-Type': out.contentType ?? 'application/octet-stream',
+          'X-Content-Type-Options': 'nosniff',
+          'Content-Security-Policy': "default-src 'none'",
+          'Cache-Control': 'private, max-age=60',
+        })
+        res.end(out.__raw)
+        return
+      }
+      json(res, 200, out)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/events') {
@@ -1270,7 +1709,10 @@ const server = http.createServer(async (req, res) => {
     }
     json(res, 404, { error: 'not found' })
   } catch (error) {
-    json(res, error.status ?? 500, { error: String(error.message ?? error) })
+    json(res, error.status ?? 500, {
+      error: String(error.message ?? error),
+      ...(typeof error.extra === 'object' && error.extra !== null ? error.extra : {}),
+    })
   }
 })
 

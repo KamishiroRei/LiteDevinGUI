@@ -46,12 +46,15 @@ node server.mjs 9000   :: 自定义端口
 - 打开会话只渲染**最新 2 轮**并沉底；滚到顶部自动向前翻页（每页 5 轮，视口锚定不跳）；快速连点只有最后一次生效（代次守卫）
 - 渲染语义区分：用户气泡 / 助手正文（按 messageId 分气泡，支持表格和复制）/ 可折叠思考 / 工具卡片（kind·标题·状态·参数·diff·终端，点开详情）/ 计划清单 / 权限请求按钮
 - 刷新页面会恢复当前会话，工作区侧栏可收起；亮色与暗色主题可切换并记住选择
-- 回合中「停止」（`session/cancel`）；busy 时底部三点弹跳指示
+- 回合中可继续输入并直接发送插话；「停止」（`session/cancel`）与底部运行指示仍跟随当前会话
 
 **输入**
 
 - 在资源管理器复制任意文件或文件夹后，直接粘贴进句子，输入框在光标处插入绝对路径。例如 `你给我查看D:\Game\DNF\国服115.pvf来理解`；发送的是这段文字，Devin 按路径读取磁盘文件
-- 粘贴剪贴板位图或拖入单张图片时，先保存到本机 `attachments/`，再在输入框插入其路径；📎 按钮可原生多选文件并插入路径。拖入文件时若浏览器未提供磁盘路径，会提示改用复制粘贴或文件选择
+- 复制磁盘上的图片文件后粘贴，直接引用原路径；剪贴板只有位图数据时，输入框立即出现 `@图片1` 与悬浮预览，后台以二进制保存一次到 `attachments/`。发送前将 `@图片1` 展开为磁盘路径，Devin 收到的仍是文本路径
+- 在当前会话输入 `@`，可按缩略图和文件名选择已出现的图片，再次插入 `@图片N` 引用；支持方向键、Enter、鼠标选择。对话中的图片路径显示为可悬浮的图片框，周围文字保持原样
+- 未发送的图片引用从草稿删除后即从临时索引移除，后续粘贴复用空出的 `图片N` 编号；已经发送或从历史发现的图片仍保留在本会话 `@` 列表
+- 📎 按钮可原生多选文件：图片转成可预览的引用，其他格式插入原路径。拖入文件时若浏览器未提供磁盘路径，会提示改用复制粘贴或文件选择
 - **按会话暂存草稿**：文字输入后自动保存，切换会话或重开页面可恢复（localStorage，发出即清）；旧版附件占位符在装载草稿时转成路径文字
 
 **顶栏**
@@ -66,7 +69,13 @@ node server.mjs 9000   :: 自定义端口
 
 **并发延期队列**
 
-共享并发预算与 Codex 协作桥梁同口径（默认 7，`DEVIN_SWE_MAX_CONCURRENCY` 7–10 封顶）。发送前先做本机容量预检（`swe_capacity.py`：busy 会话＋CLI 实例＋已登记 subagent）；满额时 prompt 进入延期队列，回合中遇到并发/配额拒绝也会自动入队重发。错误携带分钟、秒数或结构化期限时按 `期限+5s` 定时重发，期限之前不派发；未给期限时按容量与停滞探针节奏检查。队列持久化在 `deferred-prompts.json`，重启自动恢复并保持同一会话的消息顺序；「停止」会丢弃该会话尚在排队的项目。该队列是尽力而为的本机门禁（不持有全局准入锁），agent 侧的并发拒绝仍是权威兜底。
+共享并发预算与 Codex 协作桥梁同口径（默认 7，`DEVIN_SWE_MAX_CONCURRENCY` 7–10 封顶）。非运行中会话发送前先做本机容量预检（`swe_capacity.py`：busy 会话＋CLI 实例＋已登记 subagent）；同一运行中会话的插话直接交给 Devin，不额外等待容量空位。满额时新会话 prompt 进入延期队列，ACP 明确拒绝并发或配额时也会自动入队重发。错误携带分钟、秒数或结构化期限时按 `期限+5s` 定时重发，期限之前不派发；未给期限时按容量与停滞探针节奏检查。队列持久化在 `deferred-prompts.json`，重启自动恢复并保持延期消息的顺序；「停止」会丢弃该会话尚在排队的项目。该队列是尽力而为的本机门禁（不持有全局准入锁），agent 侧的并发拒绝仍是权威兜底。
+
+**Codex 协作统一入口**
+
+Codex 的 `devin-session-collaboration` 桥梁默认连接本机 Lite 的 `/api/bridge/turn/start|status`，经这个服务的单个常驻 `devin acp` 创建或续跑 SWE 会话；因此 GUI 和桥梁看见同一批会话与运行状态。桥梁的 `--cwd` 只决定会话工作目录，任务文件正文才是发给 Devin 的 prompt；使用项目或独立 checkout 根目录作 `--cwd`，避免任务区被误列为工作区。Lite 不可达时桥梁会明确失败，不自动另起 Devin。回合完成后桥梁保留自身邮箱、报告和验收记录。桥梁的取消请求按 host turn 定位；同会话另有 GUI 插话时，后端会拒绝可能波及插话的会话级取消。
+
+桥梁本机地址默认 `http://127.0.0.1:8317`，可用 `DEVIN_BRIDGE_LITE_URL` 指向另一个本机端口。只有手动设 `DEVIN_BRIDGE_TRANSPORT=cli` 才使用旧式独立 CLI 轮次。模型证据为 ACP 已选配置或已接受设置请求，不能视作末次生成步骤的独立模型证明。
 
 ## 已知限制
 
@@ -75,6 +84,8 @@ node server.mjs 9000   :: 自定义端口
 - 已用任务子目录作 `cwd` 创建的旧会话仍按原目录显示；改发会话规则不会改写它们的历史归属
 - 历史缓冲 4000 条/会话，更久远的部分不回溯（分页源是回放流，非磁盘日志）
 - 文件引用只发路径——需 devin 能访问该本地路径
+- 图片缩略图仅支持本机现存的 PNG/JPEG/GIF/WebP/BMP/AVIF 栅格文件；会话图片检索基于本进程装载的文本历史，旧的纯 base64 图片不具备磁盘路径，无法供 `@` 重用
+- 桥梁 host turn 的状态存在内存中；Lite 重启后未知 turn ID 明确报错，须先检查会话与产物，再决定是否续跑，不能自动重复执行
 
 ## 文件结构
 
@@ -87,6 +98,7 @@ node server.mjs 9000   :: 自定义端口
 | `public/favicon.svg` | Devin Lite 网页标识 |
 | `public/devin-lite.ico` | 桌面快捷方式图标 |
 | `docs/architecture.md` | 架构域、模块职责和源码索引 |
+| `codex-skill/devin-session-collaboration/` | 可追踪的 CODEX 协作手册、统一入口桥梁与契约检查；同步安装到本机 Codex skills 目录 |
 | `devin-lite.vbs` | 幂等静默启动器（先探测后拉起） |
 | `devin-lite.bat` | 控制台启动器（保留日志） |
 | `tools/probe-resume.mjs` | ACP 会话锁/方法探测脚本（调试参考） |
@@ -110,4 +122,4 @@ node server.mjs 9000   :: 自定义端口
 
 ## REST 一览（给其他客户端复用同一 acp 实例）
 
-`GET /api/status` · `GET /api/sessions` · `GET /api/archived` · `POST /api/sessions/new|load|archive|unarchive|delete|mode|config` · `GET /api/history` · `POST /api/prompt` · `POST /api/cancel` · `POST /api/permission` · `POST /api/pick-folder` · `POST /api/pick-file` · `POST /api/clipboard-files` · `POST /api/attach` · `GET /api/queue` · `POST /api/queue/drop` · `GET /api/capacity` · `GET /api/events`（SSE：update/busy/permission/prompt-done/prompt-deferred/prompt-dispatch/queue/session-archived）
+`GET /api/status` · `GET /api/sessions` · `GET /api/archived` · `POST /api/sessions/new|load|archive|unarchive|delete|mode|config` · `GET /api/history` · `GET /api/session-images` · `GET /api/image-preview` · `POST /api/prompt` · `POST /api/cancel` · `POST /api/permission` · `POST /api/pick-folder` · `POST /api/pick-file` · `POST /api/clipboard-files` · `POST /api/attach` · `POST /api/bridge/turn/start|cancel` · `GET /api/bridge/turn/status` · `GET /api/queue` · `POST /api/queue/drop` · `GET /api/capacity` · `GET /api/events`（SSE：update/busy/permission/prompt-done/prompt-deferred/prompt-dispatch/bridge-turn/queue/session-archived）
