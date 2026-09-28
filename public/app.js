@@ -217,7 +217,7 @@ function toast(text, cls = '') {
 }
 
 function showEmptyState() {
-  $('transcript').innerHTML = '<div class="empty-state"><img src="favicon.svg" width="42" height="42" alt=""><h1>开始一个会话</h1><p>选择左侧会话，或在工作区中新建会话。</p></div>'
+  $('transcript').innerHTML = '<div class="empty-state"><img src="favicon.svg" width="42" height="42" alt=""><h1>开始一个会话</h1><p>选择工作区，然后开始与 Devin 对话。</p><button class="primary empty-new" type="button">新建会话</button></div>'
 }
 
 function queueStatus(entry) {
@@ -358,11 +358,13 @@ async function refreshCapacity() {
     badge.textContent = `${cap.active}/${cap.limit}`
     badge.classList.toggle('full', available === 0)
     $('newBtn').title = `Devin 运行中 ${cap.active}/${cap.limit}，剩余 ${available}；满额时新消息会等待名额`
+    $('workspaceCapacity').textContent = `当前运行 ${cap.active}/${cap.limit} 条 Devin 会话`
   } catch (err) {
     if (seq !== capacitySeq) return
     badge.textContent = '?/10'
     badge.classList.remove('full')
     $('newBtn').title = `Devin 并发状态暂不可读：${err.message}`
+    $('workspaceCapacity').textContent = 'Devin 并发状态暂不可读'
   }
 }
 
@@ -1135,7 +1137,7 @@ function renderSessions() {
       groupUi.save()
       gEl.classList.toggle('closed')
     })
-    head.querySelector('.gnew').addEventListener('click', (e) => { e.stopPropagation(); newSession(g.cwd || undefined) })
+    head.querySelector('.gnew').addEventListener('click', (e) => { e.stopPropagation(); openNewSessionDialog(g.cwd || undefined) })
     gEl.appendChild(head)
 
     const body = document.createElement('div')
@@ -1261,14 +1263,148 @@ async function openSession(s) {
   }
 }
 
-async function newSession(cwd) {
-  cwd ??= await pickFolder()
-  if (!cwd) return
+let workspaceBrowseSeq = 0
+let workspaceBrowserPath = ''
+let workspaceBrowserParent
+let workspaceCreating = false
+
+function workspaceError(message = '') {
+  $('workspaceError').textContent = message
+  $('workspaceError').hidden = !message
+}
+
+function knownWorkspacePaths() {
+  const seen = new Set()
+  const paths = []
+  for (const cwd of [state.active?.cwd, ...state.sessions.map(s => s.cwd), ...state.archiveRows.map(s => s.cwd)]) {
+    if (typeof cwd !== 'string' || !cwd.trim()) continue
+    const key = normalizePath(cwd)
+    if (seen.has(key)) continue
+    seen.add(key)
+    paths.push(cwd)
+  }
+  return paths
+}
+
+function renderKnownWorkspaces() {
+  const host = $('knownWorkspaces')
+  host.replaceChildren()
+  const selected = normalizePath($('workspacePath').value.trim())
+  const paths = knownWorkspacePaths()
+  if (!paths.length) {
+    const empty = document.createElement('p')
+    empty.className = 'workspace-none'
+    empty.textContent = '还没有已有工作区，可从下方选择磁盘目录或直接输入路径。'
+    host.appendChild(empty)
+    return
+  }
+  for (const path of paths) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'known-workspace' + (normalizePath(path) === selected ? ' selected' : '')
+    button.title = path
+    const name = document.createElement('strong')
+    name.textContent = baseName(path)
+    const detail = document.createElement('small')
+    detail.textContent = path
+    button.append(name, detail)
+    button.addEventListener('click', () => {
+      $('workspacePath').value = path
+      workspaceError()
+      renderKnownWorkspaces()
+      void browseWorkspace(path)
+    })
+    host.appendChild(button)
+  }
+}
+
+async function browseWorkspace(path = '', selectCurrent = false) {
+  const seq = ++workspaceBrowseSeq
+  const inputAtStart = $('workspacePath').value
+  const host = $('workspaceEntries')
+  host.textContent = '正在读取目录…'
+  try {
+    const data = await api('GET', `/api/browse?path=${encodeURIComponent(path)}`)
+    if (seq !== workspaceBrowseSeq || !$('newSessionDialog').open) return
+    workspaceBrowserPath = data.path ?? ''
+    workspaceBrowserParent = data.parent
+    if (selectCurrent && $('workspacePath').value === inputAtStart) {
+      $('workspacePath').value = workspaceBrowserPath
+      renderKnownWorkspaces()
+    }
+    $('workspaceCurrent').textContent = workspaceBrowserPath || '此电脑'
+    $('workspaceUp').disabled = !workspaceBrowserPath
+    host.replaceChildren()
+    for (const entry of data.entries ?? []) {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'workspace-entry'
+      button.innerHTML = ICON.folder
+      const label = document.createElement('span')
+      label.textContent = entry.name
+      button.appendChild(label)
+      button.title = entry.path
+      button.addEventListener('click', () => {
+        $('workspacePath').value = entry.path
+        workspaceError()
+        renderKnownWorkspaces()
+        void browseWorkspace(entry.path)
+      })
+      host.appendChild(button)
+    }
+    if (!host.childElementCount) host.textContent = '此目录下没有可选的子文件夹。'
+    if (path && normalizePath(path) !== normalizePath(workspaceBrowserPath)) {
+      workspaceError(`未找到或无法读取该目录，已定位到 ${workspaceBrowserPath || '磁盘列表'}。`)
+    }
+  } catch (err) {
+    if (seq !== workspaceBrowseSeq || !$('newSessionDialog').open) return
+    host.textContent = '目录读取失败。你仍可输入路径并尝试创建。'
+    workspaceError(err.message)
+  }
+}
+
+function openNewSessionDialog(cwd) {
+  const dialog = $('newSessionDialog')
+  if (dialog.open) return
+  workspaceError()
+  $('newSessionCreate').disabled = false
+  $('newSessionCreate').textContent = '创建会话'
+  const initial = cwd || state.active?.cwd || knownWorkspacePaths()[0] || ''
+  $('workspacePath').value = initial
+  renderKnownWorkspaces()
+  dialog.showModal()
+  void refreshCapacity()
+  void browseWorkspace(initial)
+  $('workspacePath').focus()
+}
+
+function closeNewSessionDialog() {
+  if (workspaceCreating) return
+  ++workspaceBrowseSeq
+  $('newSessionDialog').close()
+}
+
+async function createNewSession() {
+  if (workspaceCreating) return
+  const cwd = $('workspacePath').value.trim()
+  if (!cwd) { workspaceError('请选择或输入工作区目录。'); $('workspacePath').focus(); return }
+  workspaceCreating = true
+  workspaceError()
+  $('newSessionCreate').disabled = true
+  $('newSessionCreate').textContent = '创建中…'
   try {
     const created = await api('POST', '/api/sessions/new', { cwd })
+    // The server validates the directory before creating the session.
     setActive({ sessionId: created.sessionId, cwd, title: '(新会话)' }, created.configOptions)
-    refreshSessions()
-  } catch (err) { alert(`创建失败：${err.message}`) }
+    ++workspaceBrowseSeq
+    $('newSessionDialog').close()
+    void refreshSessions()
+  } catch (err) { workspaceError(`创建失败：${err.message}`) }
+  finally {
+    workspaceCreating = false
+    $('newSessionCreate').disabled = false
+    $('newSessionCreate').textContent = '创建会话'
+  }
 }
 
 /**
@@ -1305,21 +1441,6 @@ function renderOptionBar() {
         .catch(err => addNote(`设置 ${opt.name ?? opt.id} 失败：${err.message}`, 'error'))
     })
     bar.appendChild(sel)
-  }
-}
-
-// ---------------------------------------------------------------------------
-// native folder picker (server-side FolderBrowserDialog)
-// ---------------------------------------------------------------------------
-
-/** Open the Windows-native folder picker; resolves to the path or undefined. */
-async function pickFolder() {
-  try {
-    const data = await api('POST', '/api/pick-folder')
-    return typeof data.path === 'string' && data.path !== '' ? data.path : undefined
-  } catch (err) {
-    addNote(`打开目录选择框失败：${err.message}`, 'error')
-    return undefined
   }
 }
 
@@ -2085,8 +2206,18 @@ $('input').addEventListener('keyup', e => { if (e.key.startsWith('Arrow') || e.k
 document.addEventListener('pointerdown', e => {
   if (!e.target.closest('#composer')) { hideMentionMenu(); hideImagePreview() }
 })
-$('newBtn').addEventListener('click', () => { void refreshCapacity(); void newSession() })
+$('newBtn').addEventListener('click', () => openNewSessionDialog())
 $('newBtn').addEventListener('pointerenter', () => { void refreshCapacity() })
+$('transcript').addEventListener('click', e => { if (e.target.closest('.empty-new')) openNewSessionDialog() })
+$('newSessionClose').addEventListener('click', closeNewSessionDialog)
+$('newSessionCancel').addEventListener('click', closeNewSessionDialog)
+$('newSessionDialog').addEventListener('cancel', e => { if (workspaceCreating) e.preventDefault(); else ++workspaceBrowseSeq })
+$('newSessionDialog').addEventListener('click', e => { if (e.target === $('newSessionDialog')) closeNewSessionDialog() })
+$('workspacePath').addEventListener('input', () => { workspaceError(); renderKnownWorkspaces() })
+$('workspacePath').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); void browseWorkspace($('workspacePath').value.trim(), true) } })
+$('workspaceLocate').addEventListener('click', () => { void browseWorkspace($('workspacePath').value.trim(), true) })
+$('workspaceUp').addEventListener('click', () => { void browseWorkspace(workspaceBrowserParent ?? '', true) })
+$('newSessionCreate').addEventListener('click', () => { void createNewSession() })
 $('reloadBtn').addEventListener('click', () => { void Promise.all([refreshSessions(), refreshArchives()]) })
 $('restartAgentBtn').addEventListener('click', () => { void restartAgent() })
 $('moreBtn').addEventListener('click', () => refreshSessions(true))

@@ -64,7 +64,7 @@
       </div>
       <div class="chat-subhead"><span class="chat-tab">对话</span><span id="optionBar"></span></div>
     </div>
-    <div id="transcript"><div class="empty-state"><img src="favicon.svg" width="42" height="42" alt=""><h1>开始一个会话</h1><p>选择左侧会话，或在工作区中新建会话。</p></div></div>
+    <div id="transcript"><div class="empty-state"><img src="favicon.svg" width="42" height="42" alt=""><h1>开始一个会话</h1><p>选择工作区，然后开始与 Devin 对话。</p><button class="primary empty-new" type="button">新建会话</button></div></div>
     <section id="queueBanner" class="queue-panel" aria-label="待处理消息" hidden>
       <div class="queue-head">
         <span class="queue-mark" aria-hidden="true">◷</span>
@@ -94,6 +94,37 @@
     </div>
   </section>
 </div>
+<dialog id="newSessionDialog" class="workspace-dialog" aria-labelledby="newSessionTitle">
+  <div class="workspace-dialog-head">
+    <div><h2 id="newSessionTitle">新建会话</h2><p>选择一个工作区，Devin 将在该目录中工作。</p></div>
+    <button id="newSessionClose" class="icon-btn" type="button" aria-label="关闭新建会话窗口">×</button>
+  </div>
+  <div class="workspace-dialog-body">
+    <section aria-label="已有工作区">
+      <h3>已有工作区</h3>
+      <div id="knownWorkspaces" class="known-workspaces"></div>
+    </section>
+    <section aria-label="选择其他目录">
+      <h3>选择其他目录</h3>
+      <div class="workspace-path-row">
+        <input id="workspacePath" type="text" spellcheck="false" autocomplete="off" aria-label="工作区绝对路径" placeholder="输入或粘贴文件夹路径，例如 D:\devin-lite">
+        <button id="workspaceLocate" type="button">定位</button>
+      </div>
+      <div class="workspace-browser-head">
+        <button id="workspaceUp" type="button" aria-label="上一级目录">↑ 上一级</button>
+        <span id="workspaceCurrent" class="mono"></span>
+      </div>
+      <div id="workspaceEntries" class="workspace-entries" role="list" aria-label="目录列表"></div>
+    </section>
+    <p id="workspaceError" class="workspace-error" role="alert" hidden></p>
+  </div>
+  <div class="workspace-dialog-foot">
+    <span id="workspaceCapacity" class="dim"></span>
+    <span class="spacer"></span>
+    <button id="newSessionCancel" type="button">取消</button>
+    <button id="newSessionCreate" class="primary" type="button">创建会话</button>
+  </div>
+</dialog>
 <div id="toastRegion" aria-live="polite"></div>
 <div id="imageHoverPreview" class="image-hover-preview" hidden></div>
 <script src="app.js"></script>
