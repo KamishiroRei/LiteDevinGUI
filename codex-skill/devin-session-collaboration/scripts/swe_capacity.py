@@ -1,4 +1,4 @@
-"""Machine-wide Devin admission: ten concurrent turns, retry every 300s."""
+"""Machine-wide Devin admission: five concurrent turns, retry every 300s."""
 from __future__ import annotations
 import contextlib
 import ctypes
@@ -11,7 +11,7 @@ import urllib.request
 import urllib.parse
 
 POLL_SECONDS = 300
-MAX_CONCURRENCY = 10
+MAX_CONCURRENCY = 5
 # A registered subagent that stops heartbeating is treated as leaked residue:
 # it stops counting after this TTL but stays on disk for `swe_subagents.py sweep`.
 SUBAGENT_TTL_SECONDS = int(os.environ.get('DEVIN_SWE_SUBAGENT_TTL', '21600'))  # 6h
@@ -229,7 +229,7 @@ def admit(start, cancelled=lambda: False, on_status=lambda *_: None,
           scan=snapshot, clock=time.monotonic, sleep=time.sleep, ceiling=None):
     cap = limit() if ceiling is None else ceiling
     if not 1 <= cap <= MAX_CONCURRENCY:
-        raise ValueError('Capacity must be in 1..10')
+        raise ValueError('Capacity must be in 1..5')
     while True:
         if cancelled():
             raise CapacityCancelled('Cancelled while waiting for capacity')

@@ -1,6 +1,6 @@
 # 当前执行者策略
 
-默认路由见[全局 AGENTS](../../../AGENTS.md)：Codex 自主判断是否委派，优先 Devin SWE-2 High；先读取桥梁 `capacity` 的当前占用，固定上限 10；并发满时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max。Devin 内部满额由原会话自行执行。Codex 保持正常工作职责；旧协作手册暂存为回退参考。
+默认路由见[全局 AGENTS](../../../AGENTS.md)：Codex 自主判断是否委派，优先 Devin SWE-2 High；先读取桥梁 `capacity` 的当前占用，固定上限 5；并发满时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max。Devin 内部满额由原会话自行执行。Codex 保持正常工作职责；旧协作手册暂存为回退参考。
 
 | 职责 | 路由 |
 |---|---|

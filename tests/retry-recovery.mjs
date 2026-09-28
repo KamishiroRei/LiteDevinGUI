@@ -145,7 +145,7 @@ async function run() {
   writeFileSync(START_LOG, '')
   writeFileSync(PROMPT_LOG, '')
   setState({
-    capacity: { active: 0, limit: 10 }, promptMode: 'ok',
+    capacity: { active: 0, limit: 5 }, promptMode: 'ok',
     sessions: [{ sessionId: 's1', title: 'test', cwd: WORK, updatedAt: new Date().toISOString() }],
   })
 
@@ -161,6 +161,25 @@ async function run() {
   await until(() => lines(START_LOG).length >= 2)
   check('idle ACP restarts on request', restarted.status === 200 && lines(START_LOG).length === 2)
 
+  // Even an old capacity script claiming ten slots cannot allow a sixth turn.
+  setState({ capacity: { active: 5, limit: 10 } })
+  const capped = await api('GET', '/api/capacity')
+  const deniedGui = await api('POST', '/api/prompt', { sessionId: 's1', cwd: WORK, text: 'sixth-gui' })
+  const deniedBridge = await api('POST', '/api/bridge/turn/start', {
+    sessionId: 's1', cwd: WORK, text: 'sixth-bridge', clientTurnId: 'turn-sixth-bridge',
+  })
+  check('capacity API clamps an old ten-slot report to five',
+    capped.body?.active === 5 && capped.body?.limit === 5 && capped.body?.available === 0)
+  check('sixth GUI and bridge turns are refused before ACP prompt',
+    deniedGui.status === 409 && deniedBridge.status === 409 && lines(PROMPT_LOG).length === 0)
+  setState({ capacity: null })
+  const unknownCapacity = await api('POST', '/api/prompt', {
+    sessionId: 's1', cwd: WORK, text: 'unknown-capacity',
+  })
+  check('unknown capacity fails closed before ACP prompt',
+    unknownCapacity.status === 503 && lines(PROMPT_LOG).length === 0)
+  setState({ capacity: { active: 0, limit: 5 } })
+
   setState({ promptMode: 'hang' })
   const running = await api('POST', '/api/bridge/turn/start', {
     sessionId: 's1', cwd: WORK, text: 'keep-busy', clientTurnId: 'turn-keep-busy',
@@ -168,6 +187,12 @@ async function run() {
   await until(() => lines(PROMPT_LOG).some(row => row.text === 'keep-busy'))
   const busyRestart = await api('POST', '/api/agent/restart', {})
   check('active turn blocks restart', running.status === 200 && busyRestart.status === 409)
+  setState({ capacity: { active: 5, limit: 5 } })
+  const sameSession = await api('POST', '/api/prompt', {
+    sessionId: 's1', cwd: WORK, text: 'same-session-interjection',
+  })
+  await until(() => lines(PROMPT_LOG).some(row => row.text === 'same-session-interjection'))
+  check('interjection to a running session uses no sixth slot', sameSession.status === 200)
   // A child crash must reject pending ACP requests so the running turn
   // settles instead of remaining stuck in "sending" forever.
   process.kill(lines(START_LOG).at(-1).pid)
@@ -176,6 +201,7 @@ async function run() {
     afterCrash.state === 'queued' && afterCrash.preview === 'keep-busy'
       && new Date(afterCrash.retryAt).getTime() >= Date.now() + 25_000)
   await drop(afterCrash.queueId)
+  setState({ capacity: { active: 0, limit: 5 } })
   if (!(await stopServer())) throw new Error('test server did not stop after busy case')
   startServer()
   await waitServer()
@@ -203,6 +229,12 @@ async function run() {
       && queueWithTwo.body.pending[0].source === 'bridge')
   const outOfOrder = await api('POST', '/api/queue/send', { queueId: secondId })
   check('manual retry refuses to overtake earlier same-session item', outOfOrder.status === 409)
+  setState({ capacity: { active: 5, limit: 5 } })
+  const fullRetry = await api('POST', '/api/queue/send', { queueId: oneMinute.queued.queueId })
+  check('manual retry at five slots leaves the item queued',
+    fullRetry.status === 409 && lines(PROMPT_LOG).length === 1
+      && (await api('GET', '/api/queue')).body?.pending?.length === 2)
+  setState({ capacity: { active: 0, limit: 5 } })
 
   setState({ promptMode: 'reject', rejectMessage: 'Too many concurrent sessions; wait 2 minutes.' })
   const directGui = await api('POST', '/api/prompt', { sessionId: 's1', cwd: WORK, text: 'controller-direct' })

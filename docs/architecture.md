@@ -41,14 +41,14 @@
 | 主控插话 | 外部主控对已有会话发 action 时，桥梁把该 turn 标记为 `dispatching` 并启动独立跟踪进程，通过 `priority` 跳过普通 runner 和容量等待；网页主动发送亦直投，同一会话普通延期项仍按序 | `devin_bridge.py` 的 `send`、`spawn_controller_interjection`、`controller_interjection`、`run_lite_turn`；`server.mjs` 的 `POST /api/prompt`、`POST /api/bridge/turn/start` |
 | 状态与延期 | `GET /api/bridge/turn/status` 长等真实回合状态；并发拒绝沿用服务端延期队列；未知 host turn 明确 404 | `server.mjs` 的 `turnSet`、`turnView`、`deferPrompt`、`GET /api/bridge/turn/status` |
 | 安全取消 | 延期项只撤本项；在途回合同 session 有别的 prompt 时拒绝会话级取消 | `server.mjs` 的 `POST /api/bridge/turn/cancel` |
-| 桥梁持久协作 | 每任务 SQLite 保存 actor/邮箱/报告/验收、Lite host turn ID、容量准入和错误记录；`capacity` 与 `start` 显示固定 10 条上限及余量，满额新建失败；不启动另一个 Devin 模型进程 | 外部 `devin-session-collaboration/scripts/devin_bridge.py` 的 `capacity_view`、`make_actor`、`run_lite_turn`；`swe_capacity.py` |
+| 桥梁持久协作 | 每任务 SQLite 保存 actor/邮箱/报告/验收、Lite host turn ID、容量准入和错误记录；`capacity` 与 `start` 显示固定 5 条上限及余量，满额新建失败；不启动另一个 Devin 模型进程 | 外部 `devin-session-collaboration/scripts/devin_bridge.py` 的 `capacity_view`、`make_actor`、`run_lite_turn`；`swe_capacity.py` |
 | Devin 内部子代理 | `run_subagent` 前在全局锁内预留一个名额；完成或失败释放，满额由父会话自行执行 | `codex-skill/devin-session-collaboration/scripts/swe_subagents.py` 的 `cmd_reserve`、`cmd_done` |
 
 ## 延期发送
 
 | 模块 | 功能 | 源码定位 |
 |---|---|---|
-| 容量读取 | 调用共享 SWE 容量脚本，按固定 10 条上限给出当前可用名额 | `server.mjs` 的 `capacitySnapshot`；`swe_capacity.py` 的 `limit` |
+| 容量读取 | 调用共享 SWE 容量脚本，按固定 5 条上限给出当前可用名额；Lite 的网页发送、桥梁启动与手动重试按此准入，新忙碌会话到 5 条时拒绝第 6 条，容量不可读时停止派发；同一运行中会话插话不新增名额 | `server.mjs` 的 `capacitySnapshot`、`withCapacityAdmission`；`swe_capacity.py` 的 `limit` |
 | 错误期限 | 从 Devin 并发或配额错误提取重发时间，包括 `limit will reset in 1 minute`；解析不到时至少等 30 秒 | `server.mjs` 的 `parseRetryAfterMs`、`MIN_RETRY_MS` |
 | 队列状态 | 持久化待发送及发送中状态；重启后把发送中记录转为延期，至少等 30 秒再派发；逐条提供摘要、全文读取、手动重试与撤销，手动重试不可越过同会话较早项目 | `server.mjs` 的 `loadQueue`、`saveQueue`、`queueView`、`GET /api/queue`、`GET /api/queue/item`、`POST /api/queue/send|drop` |
 | 调度 | 到期与容量判断后重新进入同一会话 prompt | `server.mjs` 的 `deferPrompt`、`schedulePump`、`pumpDeferred`、`dispatchPrompt` |

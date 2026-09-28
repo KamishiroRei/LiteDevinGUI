@@ -9,7 +9,7 @@ $taskRoot = 'D:\Game\DNF\DNF复刻\AI任务\本次任务'
 $state = Join-Path $taskRoot 'bridge-state'
 $prompt = Join-Path $taskRoot 'worker A\任务.txt'
 python $bridge --state $state init --name '协作任务' --root codex
-python $bridge --state $state capacity  # active / limit=10 / available
+python $bridge --state $state capacity  # active / limit=5 / available
 python $bridge --state $state start --from codex --name '实现者' --cwd $projectRoot --prompt-file $prompt
 python $bridge --state $state participants
 python $bridge --state $state status --actor a_返回的ID
@@ -17,7 +17,7 @@ python $bridge --state $state status --actor a_返回的ID
 
 `$projectRoot` 是 Devin 会话所属项目的稳定工作区；`$taskRoot` 只存本次任务的桥梁状态、任务书、隔离文件和结果。将每个 `worker A` 或 `AI任务` 子目录传给 `--cwd` 会让它们在 Devin Lite 中成为独立工作区。真正独立的项目或 checkout 才使用其自身根目录。任务范围与写入归属仍在任务书中用绝对路径写明；`--cwd` 不提供文件隔离。新建与续跑的目录选择见 [会话工作区与任务目录](../SKILL.md#会话工作区与任务目录)。
 
-`start` 自动查询实际占用，成功结果附 `capacity_before`（含 `active/limit/available`）和桥梁 actor ID、runner PID；10/10 时返回退出码 2、`admitted=false`、`action=choose_codex_subagent`（由 Codex 发起）或 `action=self_execute`（由 Devin 发起），且不会创建 actor/turn。预检与真正派发间若发生并发竞争，后台仍会按全局锁进入 `waiting_capacity`；Codex 若要改派须先取消该待执行任务。runner 经 `/api/bridge/turn/start` 创建或加载会话，使用指定 `--cwd` 作为会话工作区，并把任务文件正文作为 prompt。真正的 session ID 在 Lite 接受回合后写入 `status` / `participants`；任务文件目录或 `--state` 目录不会冒充会话工作区。Lite 端核对并选择 `swe-2-high` 与 `bypass`，回合状态与所选模型证据写入本轮 `lite-turn.json` / `export.json`。ACP 配置只能证明已选择模型，**不能冒充 CLI 导出中末次生成步骤的模型证据**；`observed_model` 因此留空。会话的登录与权限策略由同一 Lite ACP 宿主承担，工作区信任效果仍需实际验证。
+`start` 自动查询实际占用，成功结果附 `capacity_before`（含 `active/limit/available`）和桥梁 actor ID、runner PID；5/5 时返回退出码 2、`admitted=false`、`action=choose_codex_subagent`（由 Codex 发起）或 `action=self_execute`（由 Devin 发起），且不会创建 actor/turn。预检与真正派发间若发生并发竞争，后台仍会按全局锁进入 `waiting_capacity`；Codex 若要改派须先取消该待执行任务。runner 经 `/api/bridge/turn/start` 创建或加载会话，使用指定 `--cwd` 作为会话工作区，并把任务文件正文作为 prompt。真正的 session ID 在 Lite 接受回合后写入 `status` / `participants`；任务文件目录或 `--state` 目录不会冒充会话工作区。Lite 端核对并选择 `swe-2-high` 与 `bypass`，回合状态与所选模型证据写入本轮 `lite-turn.json` / `export.json`。ACP 配置只能证明已选择模型，**不能冒充 CLI 导出中末次生成步骤的模型证据**；`observed_model` 因此留空。会话的登录与权限策略由同一 Lite ACP 宿主承担，工作区信任效果仍需实际验证。
 
 旧 `DEVIN_BRIDGE_TRANSPORT=cli` 模型执行路径已禁用；设成 `cli` 会把该轮标为失败并报告明确原因，不会启动 `devin --print`。独立 CLI 仅用于只读诊断和核对旧会话，不参与新协作回合。
 

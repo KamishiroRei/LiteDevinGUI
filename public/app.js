@@ -357,11 +357,11 @@ async function refreshCapacity() {
     const available = Math.max(0, cap.limit - cap.active)
     badge.textContent = `${cap.active}/${cap.limit}`
     badge.classList.toggle('full', available === 0)
-    $('newBtn').title = `Devin 运行中 ${cap.active}/${cap.limit}，剩余 ${available}；满额时新消息会等待名额`
+    $('newBtn').title = `Devin 运行中 ${cap.active}/${cap.limit}，剩余 ${available}；满额时只能向运行中会话插话`
     $('workspaceCapacity').textContent = `当前运行 ${cap.active}/${cap.limit} 条 Devin 会话`
   } catch (err) {
     if (seq !== capacitySeq) return
-    badge.textContent = '?/10'
+    badge.textContent = '?/5'
     badge.classList.remove('full')
     $('newBtn').title = `Devin 并发状态暂不可读：${err.message}`
     $('workspaceCapacity').textContent = 'Devin 并发状态暂不可读'
@@ -1901,6 +1901,16 @@ async function send() {
   const cwd = state.active.cwd
   const rawText = $('input').value.trim()
   const atts = [...state.attachments]
+  // The live page may still be connected to an older server until its active
+  // turns finish. Keep that page from starting a sixth turn in the meantime.
+  if (!wasBusy && (rawText || atts.length)) {
+    try {
+      const cap = await api('GET', '/api/capacity')
+      if (!Number.isInteger(cap.active) || cap.active < 0) throw new Error('并发状态不可读')
+      if (cap.active >= 5) { toast('Devin 已运行 5/5 条，请等待空位后发送', 'warn'); return }
+    } catch (err) { toast(`无法确认 Devin 并发状态：${err.message}`, 'error'); return }
+    if (state.active?.sessionId !== sessionId || $('input').value.trim() !== rawText) return
+  }
   // Migrate old draft attachments to path-only text before sending. No ACP
   // image content block is emitted, including for a previously pasted image.
   for (const a of atts) {

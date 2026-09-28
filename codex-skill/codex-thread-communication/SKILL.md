@@ -29,7 +29,7 @@ SWE-2 High 按旗舰执行者使用，可自主拆分、联系同任务执行者
 
 默认不安排高频中途检查与纠正，也不要求逐阶段向 GPT-6 报批。执行者自行解决职责内问题；先在获授权的 Devin 同级或子任务间解决，真正需要主控决策、范围外授权或 GPT-6 专长时才升级。必要的过程记录用于恢复和执行者协作，主控无需逐条阅读。
 
-独立任务并行；重叠文件按写入归属串行或隔离。编辑器实例、构建输出、运行端口等共享资源也有负责人。Codex 派发新的 subagent 前运行 `devin_bridge.py --state <任务状态目录> capacity`，读取 Devin 实际活跃数与固定上限 10：有名额才派发 SWE，已满按任务难度选择 Sol Max 或 Luna Max。桥梁 `start` 也自动返回容量快照，满额时退出码 2 且不创建 actor/turn。桥梁保留对已提交任务的后台等位能力；若预检后因并发竞争进入 `waiting_capacity`，先取消待执行的 SWE 并确认不会再启动，再改派所选执行者，避免双执行。主控可直接攻坚并保留其他执行者的独立进度。Devin 内部新建工作者按[并发准入正文](../devin-session-collaboration/SKILL.md#swe-并发准入与满额等待)执行；满额由原 Devin 会话自己完成，不回流给 Codex。
+独立任务并行；重叠文件按写入归属串行或隔离。编辑器实例、构建输出、运行端口等共享资源也有负责人。Codex 派发新的 subagent 前运行 `devin_bridge.py --state <任务状态目录> capacity`，读取 Devin 实际活跃数与固定上限 5：有名额才派发 SWE，已满按任务难度选择 Sol Max 或 Luna Max。桥梁 `start` 也自动返回容量快照，满额时退出码 2 且不创建 actor/turn。桥梁保留对已提交任务的后台等位能力；若预检后因并发竞争进入 `waiting_capacity`，先取消待执行的 SWE 并确认不会再启动，再改派所选执行者，避免双执行。主控可直接攻坚并保留其他执行者的独立进度。Devin 内部新建工作者按[并发准入正文](../devin-session-collaboration/SKILL.md#swe-并发准入与满额等待)执行；满额由原 Devin 会话自己完成，不回流给 Codex。
 
 执行者间的派单、消息、回复与结论均经桥梁记录。SWE→SWE 的普通 `send` 立即入目标邮箱；目标本轮若正用 `wait` 等待该发送者，消息直接作为当前工具调用结果返回，随后 `inbox --read` 即可继续本轮。目标若正在其他工作中，只能在它主动读邮箱时获得消息，无法由发送方自动注入。Devin 同级的 `--action` 在目标当前回合结束后续跑；外部主控对已有 Devin 会话的 `send --action` 由桥梁直接提交到同一 Lite/ACP session 并单独追踪，不等普通 runner 排队。Lite GUI 的插话也直接提交同一 session 的新 prompt；已接受发送不等于模型立即应用。需要中途纠偏时按 [Devin 会话通讯](../devin-session-collaboration/SKILL.md) 的现役路径处理；身份、运行状态和结果以桥梁记录、Lite 会话与实际产物为准。
 

@@ -42,19 +42,17 @@ const DEVIN_EXE = process.env.DEVIN_EXE ?? 'devin'
 // ---------------------------------------------------------------------------
 // The local gate runs swe_capacity.py (busy lite sessions + CLI invocations +
 // self-registered subagents, same accounting the bridge uses). GUI sends and
-// external-controller interjections bypass this queue and report rejection.
+// external-controller interjections bypass this queue but still obey the
+// shared concurrency ceiling when they would start a new active session.
 const CAPACITY_SCRIPT = process.env.DEVIN_LITE_CAPACITY_SCRIPT
   ?? 'C:\\Users\\ASUS\\.codex\\skills\\devin-session-collaboration\\scripts\\swe_capacity.py'
 const CAPACITY_PYTHON = process.env.DEVIN_LITE_PYTHON ?? 'python'
-/** Fixed ten-slot bound, matching the shared admission rule. */
-const CAPACITY_FALLBACK_LIMIT = 10
+/** Hard bound even if an installed capacity script is older. */
+const CAPACITY_FALLBACK_LIMIT = 5
 /** Never submit a rejected prompt again before this interval. */
 const MIN_RETRY_MS = 30_000
 /** How often a capacity-blocked queue rechecks the shared slot count. */
 const RETRY_POLL_MS = Math.min(600_000, Math.max(MIN_RETRY_MS, Number(process.env.DEVIN_LITE_RETRY_POLL_MS ?? MIN_RETRY_MS)))
-/** After this long with no readable capacity, try one deferred prompt anyway —
- * the agent's own rejection is the authoritative full/empty signal. */
-const PROBE_AFTER_MS = Math.min(3_600_000, Math.max(60_000, Number(process.env.DEVIN_LITE_PROBE_AFTER_MS ?? 300_000)))
 const QUEUE_FILE = join(ROOT, 'deferred-prompts.json')
 const CONCURRENCY_RE = new RegExp(
   process.env.DEVIN_LITE_CONCURRENCY_RE
@@ -744,13 +742,39 @@ function capacitySnapshot() {
       clearTimeout(timer)
       try {
         const parsed = JSON.parse(out)
-        if (typeof parsed.active !== 'number' || typeof parsed.limit !== 'number') throw new Error('bad shape')
-        resolvePromise({ active: parsed.active, limit: parsed.limit,
-          available: Math.max(0, parsed.limit - parsed.active), at: Date.now() })
+        if (!Number.isInteger(parsed.active) || parsed.active < 0 || !Number.isInteger(parsed.limit) || parsed.limit < 1) {
+          throw new Error('bad shape')
+        }
+        const limit = CAPACITY_FALLBACK_LIMIT
+        resolvePromise({ active: parsed.active, limit,
+          available: Math.max(0, limit - parsed.active), at: Date.now() })
       } catch { resolvePromise(null) }
     })
   }).finally(() => { capacityInflight = undefined })
   return capacityInflight
+}
+
+// Serialise every Lite dispatch decision. dispatchPrompt marks a session busy
+// synchronously, so the next check can observe the slot before it is released.
+let admissionTail = Promise.resolve()
+async function withCapacityAdmission(sessionId, start) {
+  let release
+  const previous = admissionTail
+  admissionTail = new Promise(resolvePromise => { release = resolvePromise })
+  await previous
+  try {
+    // A controller interjection to an already running session adds no session.
+    if (!acp.busy.has(sessionId)) {
+      const cap = await capacitySnapshot()
+      if (cap === null) throw httpError(503, '无法确认 Devin 并发状态，请稍后重试')
+      if (cap.active >= CAPACITY_FALLBACK_LIMIT) {
+        throw httpError(409, `Devin 并发已达上限 ${cap.active}/${CAPACITY_FALLBACK_LIMIT}`, { capacity: cap })
+      }
+    }
+    return await start()
+  } finally {
+    release()
+  }
 }
 
 const isConcurrencyError = (error) => CONCURRENCY_RE.test(String(error?.message ?? error))
@@ -951,9 +975,6 @@ async function pumpDeferred() {
     const cap = await capacitySnapshot()
     lastCapacity = cap === null ? { error: 'capacity check failed', at: Date.now() } : cap
     let slots = cap === null ? 0 : Math.max(0, cap.limit - cap.active)
-    // Stall probe: slots exhausted or unreadable for a long while → probe one
-    // entry at a time; the agent's own rejection re-defers it if still full.
-    let probes = 0
     const blocked = new Set()
     for (const entry of deferred) {
       if (entry.state !== 'queued') { blocked.add(entry.sessionId); continue }
@@ -966,26 +987,24 @@ async function pumpDeferred() {
       }
       if ((entry.retryAt ?? 0) > Date.now()) { blocked.add(entry.sessionId); continue }
       entry.lastCheckAt = Date.now()
-      if (slots > 0) {
+      if (slots <= 0) { blocked.add(entry.sessionId); continue }
+      try {
+        await withCapacityAdmission(entry.sessionId, () => {
+          entry.attempts++
+          entry.lastAttemptAt = Date.now()
+          acp.emit({
+            kind: 'prompt-dispatch', sessionId: entry.sessionId, queueId: entry.queueId, attempt: entry.attempts,
+            ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}),
+          })
+          if (entry.turnId !== undefined) {
+            const turn = bridgeTurns.get(entry.turnId)
+            if (turn !== undefined) turnSet(turn, 'running', { attempts: entry.attempts, retryAt: undefined, queueId: undefined, lastError: undefined })
+          }
+          log(`dispatching deferred prompt for ${entry.sessionId} (attempt ${entry.attempts})`)
+          void dispatchPrompt(entry)
+        })
         slots--
-      } else {
-        blocked.add(entry.sessionId)
-        if ((entry.lastAttemptAt ?? entry.queuedAt) > Date.now() - PROBE_AFTER_MS) continue
-        if (probes >= 1) continue
-        probes++
-      }
-      entry.attempts++
-      entry.lastAttemptAt = Date.now()
-      acp.emit({
-        kind: 'prompt-dispatch', sessionId: entry.sessionId, queueId: entry.queueId, attempt: entry.attempts,
-        ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}),
-      })
-      if (entry.turnId !== undefined) {
-        const turn = bridgeTurns.get(entry.turnId)
-        if (turn !== undefined) turnSet(turn, 'running', { attempts: entry.attempts, retryAt: undefined, queueId: undefined, lastError: undefined })
-      }
-      log(`dispatching deferred prompt for ${entry.sessionId} (attempt ${entry.attempts})`)
-      void dispatchPrompt(entry)
+      } catch { blocked.add(entry.sessionId) } // still full or unreadable; keep queued
     }
     saveQueue()
     acp.emit({ kind: 'queue', pending: deferred.length })
@@ -1302,17 +1321,19 @@ const routes = {
       throw httpError(400, 'sessionId and text or images required')
     }
     const dir = requireDir(cwd)
-    // The browser's explicit send is a controller interjection. It bypasses
-    // older deferred work and the local capacity preflight; if Devin rejects
-    // it, report the failure to the sender instead of silently queueing it.
+    // The browser's explicit send bypasses older deferred work. A new active
+    // session still needs a free slot; an already running session can be
+    // interjected without increasing the active session count.
     const entry = { sessionId, cwd: dir, text: text ?? '', images: imgs, committed: false,
       attempts: 0, queuedAt: Date.now(), lastError: null, state: 'queued', clientMessageId,
       source: 'gui', priority: true }
     // The prompt resolves when the turn ends — potentially minutes later.
     // Answer immediately and report the outcome over SSE instead.
-    entry.attempts++
-    void dispatchPrompt(entry)
-    return { started: true }
+    return withCapacityAdmission(sessionId, () => {
+      entry.attempts++
+      void dispatchPrompt(entry)
+      return { started: true }
+    })
   },
 
   /**
@@ -1337,6 +1358,7 @@ const routes = {
     if (typeof text !== 'string' || (text.trim() === '' && imgs.length === 0)) throw httpError(400, 'text or images required')
     const modelId = typeof model === 'string' && model !== '' ? model : 'swe-2-high'
     const mode = typeof modeId === 'string' && modeId !== '' ? modeId : 'bypass'
+    return withCapacityAdmission(requestedSid, async () => {
     await acp.ensure()
     let created
     if (typeof requestedSid === 'string' && requestedSid !== '') {
@@ -1383,6 +1405,7 @@ const routes = {
       ...(clientMessageId !== undefined ? { clientMessageId } : {}),
       ...(typeof clientTurnId === 'string' ? { clientTurnId } : {}),
     }
+    })
   },
 
   /**
@@ -1473,20 +1496,22 @@ const routes = {
     if (deferred.slice(0, index).some(e => e.sessionId === entry.sessionId)) {
       throw httpError(409, '请先处理本会话更早的排队消息')
     }
-    entry.state = 'sending'
-    entry.attempts = (Number(entry.attempts) || 0) + 1
-    entry.lastAttemptAt = Date.now()
-    saveQueue()
-    acp.emit({ kind: 'prompt-dispatch', sessionId: entry.sessionId, queueId,
-      attempt: entry.attempts,
-      ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}) })
-    if (entry.turnId !== undefined) {
-      const turn = bridgeTurns.get(entry.turnId)
-      if (turn !== undefined) turnSet(turn, 'running', { attempts: entry.attempts, retryAt: undefined, queueId: undefined, lastError: undefined })
-    }
-    log(`manually dispatching deferred prompt for ${entry.sessionId} (attempt ${entry.attempts})`)
-    void dispatchPrompt(entry)
-    return { started: true, queueId }
+    return withCapacityAdmission(entry.sessionId, () => {
+      entry.state = 'sending'
+      entry.attempts = (Number(entry.attempts) || 0) + 1
+      entry.lastAttemptAt = Date.now()
+      saveQueue()
+      acp.emit({ kind: 'prompt-dispatch', sessionId: entry.sessionId, queueId,
+        attempt: entry.attempts,
+        ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}) })
+      if (entry.turnId !== undefined) {
+        const turn = bridgeTurns.get(entry.turnId)
+        if (turn !== undefined) turnSet(turn, 'running', { attempts: entry.attempts, retryAt: undefined, queueId: undefined, lastError: undefined })
+      }
+      log(`manually dispatching deferred prompt for ${entry.sessionId} (attempt ${entry.attempts})`)
+      void dispatchPrompt(entry)
+      return { started: true, queueId }
+    })
   },
 
   'GET /api/capacity': async () => {

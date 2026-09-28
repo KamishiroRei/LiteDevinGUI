@@ -50,7 +50,7 @@ class LiteTurnTests(unittest.TestCase):
 
     @staticmethod
     def admitted(start, **kwargs):
-        kwargs["on_status"]("admitted", {"active": 0, "limit": 10})
+        kwargs["on_status"]("admitted", {"active": 0, "limit": 5})
         return start()
 
     def test_turn_uses_one_host_and_preserves_path_prompt(self):
@@ -102,13 +102,33 @@ class LiteTurnTests(unittest.TestCase):
                         "observedModel": "swe-2-high", "modelEvidence": "set-request"}
             return {"status": "done", "sessionId": "existing-session", "stopReason": "end_turn"}
 
-        with patch.object(bridge, "admit_swe", side_effect=AssertionError("capacity gate called")):
-            with patch.object(bridge, "lite_request", fake_request):
-                code, sid, _ = bridge.run_lite_turn(
-                    self.state, self.actor_id, self.token, self.turn_id, actor, turn)
+        with patch.object(bridge, "admit_swe", side_effect=AssertionError("capacity wait called")):
+            with patch.object(bridge, "swe_snapshot", return_value={"active": 5,
+                    "sessions": [{"session_id": "existing-session"}]}):
+                with patch.object(bridge, "lite_request", fake_request):
+                    code, sid, _ = bridge.run_lite_turn(
+                        self.state, self.actor_id, self.token, self.turn_id, actor, turn)
         self.assertEqual((code, sid), (0, "existing-session"))
         self.assertTrue(calls[0][2]["priority"])
         self.assertEqual(calls[0][2]["sessionId"], "existing-session")
+
+    def test_controller_action_cannot_start_sixth_idle_session(self):
+        con = bridge.connect(self.state)
+        try:
+            t = bridge.now()
+            con.execute("UPDATE actors SET session_id=? WHERE id=?", ("idle-session", self.actor_id))
+            con.execute("""INSERT INTO messages(id,sender_id,recipient_id,kind,body,created_at)
+                           VALUES (?,?,?,?,?,?)""", ("m-idle", "codex", self.actor_id, "action", "interject", t))
+            con.execute("UPDATE turns SET kind='message',message_id=? WHERE id=?", ("m-idle", self.turn_id))
+            actor = bridge.actor(con, self.actor_id)
+            turn = con.execute("SELECT * FROM turns WHERE id=?", (self.turn_id,)).fetchone()
+        finally:
+            con.close()
+        with patch.object(bridge, "swe_snapshot", return_value={"active": 5, "sessions": []}):
+            with patch.object(bridge, "lite_request", side_effect=AssertionError("host called")):
+                with self.assertRaisesRegex(bridge.BridgeError, "capacity full"):
+                    bridge.run_lite_turn(self.state, self.actor_id, self.token,
+                                         self.turn_id, actor, turn)
 
     def test_devin_peer_action_still_uses_capacity_gate(self):
         con = bridge.connect(self.state)
@@ -271,7 +291,7 @@ class LiteTurnTests(unittest.TestCase):
         task.write_text("check", encoding="utf-8")
         args = argparse.Namespace(state=str(self.state), sender="codex", name="capacity-test",
                                   cwd=self.tmp.name, prompt_file=str(task))
-        with patch.object(bridge, "capacity_view", return_value={"active": 10, "limit": 10, "available": 0}):
+        with patch.object(bridge, "capacity_view", return_value={"active": 5, "limit": 5, "available": 0}):
             with self.assertRaises(bridge.BridgeCapacityFull) as caught:
                 bridge.make_actor(args)
         self.assertEqual(caught.exception.action, "choose_codex_subagent")
@@ -280,7 +300,7 @@ class LiteTurnTests(unittest.TestCase):
             self.assertEqual(con.execute("SELECT count(*) FROM actors WHERE kind='devin'").fetchone()[0], 1)
         finally:
             con.close()
-        with patch.object(bridge, "capacity_view", return_value={"active": 9, "limit": 10, "available": 1}):
+        with patch.object(bridge, "capacity_view", return_value={"active": 4, "limit": 5, "available": 1}):
             with patch.object(bridge, "lite_request", return_value={"agentInfo": {"name": "affogato"}, "authed": False}), patch.object(bridge, "spawn_runner", return_value=123):
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
@@ -289,16 +309,18 @@ class LiteTurnTests(unittest.TestCase):
         self.assertEqual(created["capacity_before"]["available"], 1)
         self.assertEqual(created["runner_pid"], 123)
 
-    def test_fixed_ten_slot_limit(self):
-        with patch.dict(os.environ, {"DEVIN_SWE_MAX_CONCURRENCY": "7"}):
-            self.assertEqual(swe_capacity.limit(), 10)
+    def test_fixed_five_slot_limit(self):
+        with patch.dict(os.environ, {"DEVIN_SWE_MAX_CONCURRENCY": "10"}):
+            self.assertEqual(swe_capacity.limit(), 5)
+        with self.assertRaisesRegex(ValueError, "1..5"):
+            swe_capacity.admit(lambda: None, ceiling=6)
 
     def test_start_does_not_register_when_lite_is_unavailable(self):
         task = Path(self.tmp.name) / "task.txt"
         task.write_text("check", encoding="utf-8")
         args = argparse.Namespace(state=str(self.state), sender="codex", name="offline",
                                   cwd=self.tmp.name, prompt_file=str(task))
-        with patch.object(bridge, "capacity_view", return_value={"active": 0, "limit": 10, "available": 10}):
+        with patch.object(bridge, "capacity_view", return_value={"active": 0, "limit": 5, "available": 5}):
             with patch.object(bridge, "lite_request", side_effect=bridge.BridgeError("Lite unavailable")):
                 with self.assertRaises(bridge.BridgeError):
                     bridge.make_actor(args)
@@ -317,17 +339,17 @@ class SubagentReservationTests(unittest.TestCase):
     def test_reserve_before_launch_and_release(self):
         args = argparse.Namespace(parent="parent-session", title="task", host_pid=None)
         with patch.dict(os.environ, {"LOCALAPPDATA": self.tmp.name}):
-            with patch.object(swe_subagents, "snapshot", return_value={"active": 9}):
+            with patch.object(swe_subagents, "snapshot", return_value={"active": 4}):
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
                     result = swe_subagents.cmd_reserve(args)
             self.assertEqual(result, 0)
             admitted = json.loads(output.getvalue())
             self.assertEqual((admitted["active_after"], admitted["limit"], admitted["available_after"]),
-                             (10, 10, 0))
+                             (5, 5, 0))
             token = admitted["reservation_id"]
             self.assertTrue(swe_subagents.entry_path(token).is_file())
-            with patch.object(swe_subagents, "snapshot", return_value={"active": 10}):
+            with patch.object(swe_subagents, "snapshot", return_value={"active": 5}):
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
                     result = swe_subagents.cmd_reserve(args)

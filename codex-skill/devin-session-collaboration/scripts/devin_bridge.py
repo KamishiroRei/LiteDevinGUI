@@ -525,12 +525,12 @@ You are participant {a['id']} ({a['name']}); your organizer is {a['parent_id']}.
  Your session workspace is {a['cwd']}; task-specific file scope and write ownership come from the task below. The bridge state is {state}, not the session workspace.
 Use this exact PowerShell command prefix: {base}
 All collaboration model turns use the resident Devin Lite ACP through this bridge. Do not launch a separate devin --print or devin acp for a peer task.
-Check live Devin capacity before creating a worker: {base} capacity. The shared limit is 10. If full, perform the work in your own Devin session; do not hand capacity overflow to Codex.
+Check live Devin capacity before creating a worker: {base} capacity. The shared limit is 5. If full, perform the work in your own Devin session; do not hand capacity overflow to Codex.
 Discover peers: {base} participants
 Read and mark your mailbox: {base} inbox --participant {aid} --read
 Send a note: {base} send --from {aid} --to <participant-id> --body-file <UTF-8-file>
 Send a request needing a new model turn: add --action to send; it queues for the recipient's original session.
-Create an independent SWE-2 High worker: {base} start --from {aid} --name <name> --cwd <stable-project-or-checkout-root> --prompt-file <UTF-8-task-file>. This creation command reports current active/available capacity and refuses at 10/10. Keep per-task folders in the task file and bridge state; use a task folder as cwd only when it is truly its own project/checkout or the user wants a separate workspace.
+Create an independent SWE-2 High worker: {base} start --from {aid} --name <name> --cwd <stable-project-or-checkout-root> --prompt-file <UTF-8-task-file>. This creation command reports current active/available capacity and refuses at 5/5. Keep per-task folders in the task file and bridge state; use a task folder as cwd only when it is truly its own project/checkout or the user wants a separate workspace.
 For an internal run_subagent child, first reserve a slot: {subagents} reserve --parent <your-session-id> --title <task-title>. Launch only when admitted=true; on exit code 2, perform the work yourself. Release the returned reservation_id after the child completes or fails: {subagents} done --agent <reservation_id>. For a long task, refresh with heartbeat --agent <reservation_id>.
 When you need a peer's reply in this model turn, send a normal note and wait for that peer: {base} wait --self {aid} --actor <peer-id> --timeout 600; then mark the returned message read with inbox --read. Wait only when the reply is needed, not while independent work remains.
 Report a finished result: {base} report --from {aid} --to <recipient-id> --summary-file <UTF-8-file> --artifact <path>
@@ -1113,7 +1113,7 @@ def run_lite_turn(state: Path, actor_id: str, token: str | None, turn_id: str,
     # An external controller's action to an existing session is an
     # interjection. It uses that session's existing host and must not wait
     # behind unrelated new-session capacity admission. Devin-to-Devin actions
-    # and initial turns still pass through the shared ten-slot gate.
+    # and initial turns still pass through the shared five-slot gate.
     controller_message = False
     if a["session_id"] and turn["kind"] == "message" and turn["message_id"]:
         con = connect(state)
@@ -1125,6 +1125,15 @@ def run_lite_turn(state: Path, actor_id: str, token: str | None, turn_id: str,
         finally:
             con.close()
     if controller_message:
+        # The resident host is the final gate. This preflight also protects an
+        # older host until its active turns finish and it can be restarted.
+        try:
+            current = swe_snapshot()
+        except Exception as exc:
+            raise BridgeError(f"Cannot determine Devin capacity for controller action: {exc}") from exc
+        if current["active"] >= swe_limit() and not any(
+                row.get("session_id") == a["session_id"] for row in current.get("sessions", [])):
+            raise BridgeError(f"Devin capacity full: {current['active']}/{swe_limit()}; target session is not running")
         payload["priority"] = True
         started = lite_request("POST", "/api/bridge/turn/start", payload)
     else:
