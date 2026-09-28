@@ -42,6 +42,7 @@
 | 状态与延期 | `GET /api/bridge/turn/status` 长等真实回合状态；并发拒绝沿用服务端延期队列；未知 host turn 明确 404 | `server.mjs` 的 `turnSet`、`turnView`、`deferPrompt`、`GET /api/bridge/turn/status` |
 | 安全取消 | 延期项只撤本项；在途回合同 session 有别的 prompt 时拒绝会话级取消 | `server.mjs` 的 `POST /api/bridge/turn/cancel` |
 | 桥梁持久协作 | 每任务 SQLite 保存 actor/邮箱/报告/验收、Lite host turn ID、容量准入和错误记录；`capacity` 与 `start` 显示固定 5 条上限及余量，满额新建失败；不启动另一个 Devin 模型进程 | 外部 `devin-session-collaboration/scripts/devin_bridge.py` 的 `capacity_view`、`make_actor`、`run_lite_turn`；`swe_capacity.py` |
+| Codex 原聊天回报 | Devin 侧直达命令先持久化 wake event；继承 Codex 宿主 pipe 的桥梁 runner 在本轮状态轮询中只投递新增事件一次。既有待发和遭拒事件保留供显式检查/重试 | `devin_bridge.py` 的 `submit_wake`、`wake_ids`、`deliver_new_wakes`、`dispatch_wake` |
 | Devin 内部子代理 | `run_subagent` 前在全局锁内预留一个名额；完成或失败释放，满额由父会话自行执行 | `codex-skill/devin-session-collaboration/scripts/swe_subagents.py` 的 `cmd_reserve`、`cmd_done` |
 
 ## 延期发送

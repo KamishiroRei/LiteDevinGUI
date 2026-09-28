@@ -75,9 +75,9 @@ devin list --format json
 
 父会话和同级可直接收结果。等待期间保持邮箱可用；并行调度考虑等待者和子任务的依赖，避免占满槽位后彼此永远等候。任务彼此不重叠时可同 cwd 工作；重叠写入或共享编辑器、端口、构建产物时约定归属或隔离。
 
-回送 Codex 原聊天使用任务绑定的 UUID 与宿主 `codex_app/send_message_to_thread`。当前 `send --direct`、`report --final`、`block` 先持久化事件，再经 Codex 注入的本地 app-tools pipe 发信；不再走 `codex queue`，直达失败也不静默排队。`--direct` 只用于确需主控当前处理的协作消息，普通 `send` / 不带 `--final` 的 `report` 只进 Codex 持久邮箱。宿主已接受、原聊天实际可见、模型已处理是不同状态；首次实战仍须确认后两层，本次仅完成静态实现和只读工具目录检查。后台程序只做持久化、筛选、去重和投递；普通消息及中间报告不自动启动 GPT-6。完整职责策略见 [Codex 协作](../codex-thread-communication/SKILL.md)。
+回送 Codex 原聊天使用任务绑定的 UUID 与宿主 `codex_app/send_message_to_thread`。`send --direct`、`report --final`、`block` 先持久化事件；Devin 侧创建的事件由持有 app-tools pipe 的 Codex 桥梁 runner 投递，Codex 侧直接执行命令且已有 pipe 时可同步投递。Devin Lite 持有的 ACP 进程没有继承 Codex pipe，因此 Devin 侧命令只落盘，不直接调用宿主。不再走 `codex queue`，直达失败也不静默排队或反复重试。`--direct` 只用于确需主控当前处理的协作消息，普通 `send` / 不带 `--final` 的 `report` 只进 Codex 持久邮箱。宿主已接受、原聊天实际可见、模型已处理是不同状态；首次实战仍须确认后两层。后台程序只做持久化、筛选、去重和投递；普通消息及中间报告不自动启动 GPT-6。完整职责策略见 [Codex 协作](../codex-thread-communication/SKILL.md)。
 
-当前直达覆盖 **SWE → 原 Codex 聊天** 的显式 direct 消息、最终报告和真实阻塞：桥梁只构造固定工具名与任务绑定的目标线程，不提供任意宿主工具调用命令。运行环境必须继承 `CODEX_APP_TOOLS_PIPE_PATH`，该路径本身是宿主能力，只在受信本机协作任务中使用；缺失、宿主拒绝、超时分别保留可恢复状态，使用 `wake-status` 与 `wake-retry` 处理。SWE → SWE 的当前轮自动注入仍需要 Devin 版本明确支持的运行中接口；现役邮箱主动读取与下一轮 action 不能冒充该能力。当前边界和命令以 [桥梁 CLI](references/bridge-cli.md) 为准。
+当前直达覆盖 **SWE → 原 Codex 聊天** 的显式 direct 消息、最终报告和真实阻塞：桥梁只构造固定工具名与任务绑定的目标线程，不提供任意宿主工具调用命令。Codex 启动 runner 时须继承 `CODEX_APP_TOOLS_PIPE_PATH`；该路径不交给 Devin ACP，也不写入任务状态。runner 每次只尝试自身启动后新增的事件一次；旧 `pending`、宿主拒绝后的 `pending` 及结果不明的 `attempting` 不自动重发。没有可用 Codex runner 时事件留在邮箱，可查 `wake-status` 并由主控显式 `wake-retry`。SWE → SWE 的当前轮自动注入仍需要 Devin 版本明确支持的运行中接口；现役邮箱主动读取与下一轮 action 不能冒充该能力。当前边界和命令以 [桥梁 CLI](references/bridge-cli.md) 为准。
 
 ## 接受、返工与恢复
 

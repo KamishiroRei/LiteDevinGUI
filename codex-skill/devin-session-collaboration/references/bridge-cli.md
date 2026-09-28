@@ -31,8 +31,8 @@ python $bridge --state $state status --actor a_返回的ID
 | 另一个本地 SWE | `send --action` | 邮箱消息与 `turns` 中的后续任务同事务保存；当前回合结束后由 Lite 的原 session 执行 | 否 |
 | 已有 Devin 会话（外部主控发送） | `send --action` | 消息与 turn 持久保存；独立跟踪进程经同一 Lite/ACP 直接发 prompt，结果写回该 turn | 请求直接投递；模型实际应用仍看回合结果 |
 | 原 Codex 聊天 | 普通 `send` 或不带 `--final` 的 `report` | Codex 参与者的持久邮箱/报告，供主控自行读取 | 否 |
-| 原 Codex 聊天 | `send --direct` | 明确有行动价值的消息先保存到邮箱与事件，再调宿主发信 | 与 Codex 会话间工具同源；真实接收尚未实测 |
-| 原 Codex 聊天 | `report --final` 或 `block` | 持久事件后通过 Codex app-tools pipe 调宿主 `send_message_to_thread` | 使用与 Codex 会话间发信相同的宿主入口；真实接收尚未实测 |
+| 原 Codex 聊天 | `send --direct` | 明确有行动价值的消息先保存到邮箱与事件；Codex runner 投递本轮新增事件 | 与 Codex 会话间工具同源；真实接收仍需核对 |
+| 原 Codex 聊天 | `report --final` 或 `block` | 持久事件后由 Codex runner 经 app-tools pipe 调宿主 `send_message_to_thread` | 使用与 Codex 会话间发信相同的宿主入口；真实接收仍需核对 |
 
 默认桥梁的 `run_turn` 经 Lite HTTP 进入同一个 ACP 宿主：新会话 `session/new`，续轮 `session/load`，随后 `session/prompt`。桥梁普通 `send` 则只写任务邮箱，没有自动把消息塞入正在生成的模型；接收方主动 `wait` / `inbox` 才能在该轮看到它。外部主控对已有 Devin 会话的 `send --action` 和 Lite GUI 的“插话”会直接提交另一条 prompt，可观察接受与回合状态；这仍不等于经验证的模型级 `session/inject`。上游 [ACP 注入提案](https://github.com/agentclientprotocol/agent-client-protocol/pull/2043)不能当作当前 Devin 实现。单独启动 CLI 去抢同一 session 仍不可取。
 
@@ -44,9 +44,9 @@ SWE 同级需要当轮互答时，发送方用普通 `send`，接收方在确实
 
 Codex 把 SWE-2 High 作为异步自主 subagent 委派任务，一次说清目标、效果和方向，轻量确认正常启动、无明显运行故障后即可放手。有独立工作照常做，无事直接 idle，不持续查询状态或阻塞等待。桥梁的 Codex 邮箱一直可读；有行动价值的协作消息可显式 `send --direct`，受委派任务完成用 `report --final`，真实阻塞用 `block`。三者都向任务绑定的**原 Codex 聊天**发送事件索引和简短实际内容，当前适配调用宿主 `codex_app/send_message_to_thread`，不再调用 `codex queue`。普通进度继续留在邮箱。它不调用 Devin 账户中的 GPT-6，不创建新推理会话，也不定时让模型轮询。
 
-Codex Agent 间的原生发信入口是宿主提供的 `mcp__codex_app__send_message_to_thread`；SWE 进程不直接拥有该 MCP 工具，但继承 Codex 注入的 `CODEX_APP_TOOLS_PIPE_PATH`。桥梁按现役 `codex-app-tools` 插件的本地协议发送：先对宿主 pipe 做只读 `tools/list`，确认精确工具 `codex_app/send_message_to_thread`，再用 4 字节小端长度帧承载 JSON-RPC `tools/call`；外层调用线程与工具参数目标线程都取 `meta.codex_thread` 绑定的原聊天 UUID。当前宿主 pipe 与工具目录已只读检查，未发送实战消息。pipe 路径属于宿主能力，只在受信的本机协作任务中继承，不记录到任务状态或日志。此路由复用 Codex 会话间工具，由宿主决定 active/idle 的投递，不打开另一个 App Server、Responses API 会话或 GPT-6 聊天。[OpenAI 对 Queue 与 Steer 的说明](https://developers.openai.com/blog/mastering-codex-remote-for-engineering)可用于区分实际接收效果；本次不能以工具目录存在代替活跃轮直达证据。
+Codex Agent 间的原生发信入口是宿主提供的 `mcp__codex_app__send_message_to_thread`；SWE 进程不直接拥有该 MCP 工具，Lite 持有的 ACP 进程也不继承 Codex 注入的 `CODEX_APP_TOOLS_PIPE_PATH`。由 Codex 启动并继承 pipe 的桥梁 runner 在本轮状态轮询时投递新增事件。桥梁按现役 `codex-app-tools` 插件的本地协议发送：先对宿主 pipe 做只读 `tools/list`，确认精确工具 `codex_app/send_message_to_thread`，再用 4 字节小端长度帧承载 JSON-RPC `tools/call`；外层调用线程与工具参数目标线程都取 `meta.codex_thread` 绑定的原聊天 UUID。pipe 路径属于宿主能力，不交给 Devin ACP，也不记录到任务状态或日志。此路由复用 Codex 会话间工具，由宿主决定 active/idle 的投递，不打开另一个 App Server、Responses API 会话或 GPT-6 聊天。工具目录可读不等于目标聊天实际收到消息。
 
-桥梁先持久化事件 ID，再向宿主发送。发信正文包含事件 ID、actor/ref、状态目录索引和最多 2000 字符的实际消息、报告摘要或阻塞正文；超出部分留在桥梁中。宿主明确拒绝或 pipe 缺失时事件保持 `pending`，用 `wake-retry` 重试；请求写出后断连、异常返回或超时则保持 `attempting`，先查原聊天是否已有该事件 ID，再决定是否用 `wake-retry --allow-uncertain`。宿主成功返回只记 `submitted_at` / `host_accepted`；原聊天看到事件 ID 后由 Codex 用 `wake-ack` 记 `received_at`，模型是否处理还要看实际后续动作。旧 `queued` 事件保留历史状态，不自动改投造成重复消息。失败没有 `codex queue` 兜底。SWE→SWE 的运行中模型注入仍属另一条未接通的链，见上一节。
+桥梁先持久化事件 ID。持有 pipe 的 Codex runner 只尝试它启动后新增的 `pending` 事件一次；没有可用 runner、pipe 缺失或宿主明确拒绝时，事件保持 `pending`，旧事件和拒绝后的事件不会被自动扫出重发。发信正文包含事件 ID、actor/ref、状态目录索引和最多 2000 字符的实际消息、报告摘要或阻塞正文；超出部分留在桥梁中。主控可检查 `wake-status` 后显式 `wake-retry`；请求写出后断连、异常返回或超时则保持 `attempting`，先查原聊天是否已有该事件 ID，再决定是否用 `wake-retry --allow-uncertain`。宿主成功返回只记 `submitted_at` / `host_accepted`；原聊天看到事件 ID 后由 Codex 用 `wake-ack` 记 `received_at`，模型是否处理还要看实际后续动作。旧 `queued` 事件保留历史状态，不自动改投造成重复消息。失败没有 `codex queue` 兜底。SWE→SWE 的运行中模型注入仍属另一条未接通的链，见上一节。
 
 ```powershell
 # 新任务可在 init 时指定；已存在状态库可增量配置，不清空原队列。

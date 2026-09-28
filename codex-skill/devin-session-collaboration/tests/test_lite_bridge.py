@@ -330,6 +330,117 @@ class LiteTurnTests(unittest.TestCase):
         finally:
             con.close()
 
+    def test_devin_final_report_waits_for_codex_owned_runner(self):
+        con = bridge.connect(self.state)
+        try:
+            con.execute("INSERT INTO meta(key,value) VALUES ('codex_thread',?)",
+                        ("11111111-1111-4111-8111-111111111111",))
+            with bridge.transaction(con):
+                old_event = bridge.new_wake(con, self.state, "probe", "codex", None)
+        finally:
+            con.close()
+        seen = bridge.wake_ids(self.state)
+        self.assertIn(old_event, seen)
+        summary = Path(self.tmp.name) / "final.txt"
+        summary.write_text("工作已经完成", encoding="utf-8")
+        args = argparse.Namespace(state=str(self.state), sender=self.actor_id,
+                                  recipient="codex", summary_file=str(summary),
+                                  artifact=[], final=True)
+        output = io.StringIO()
+        with patch.dict(os.environ, {bridge.HOST_PIPE_ENV: ""}):
+            with patch.object(bridge, "dispatch_wake") as direct:
+                with contextlib.redirect_stdout(output):
+                    bridge.report(args)
+            direct.assert_not_called()
+        result = json.loads(output.getvalue())
+        event_id = result["wake"]["event_id"]
+        self.assertEqual(result["wake"]["route"], "codex_runner")
+        con = bridge.connect(self.state)
+        try:
+            with bridge.transaction(con):
+                manual_probe = bridge.new_wake(con, self.state, "probe", "codex", None)
+        finally:
+            con.close()
+        con = bridge.connect(self.state)
+        try:
+            self.assertEqual(con.execute("SELECT status FROM reports WHERE id=?",
+                                         (result["report_id"],)).fetchone()[0], "submitted")
+            self.assertEqual(tuple(con.execute("SELECT status,attempt_count FROM wake_events WHERE id=?",
+                                               (event_id,)).fetchone()), ("pending", 0))
+        finally:
+            con.close()
+
+        delivered = []
+        def fake_dispatch(state, wake_id):
+            delivered.append(wake_id)
+            return {"status": "host_accepted", "event_id": wake_id}
+
+        with patch.dict(os.environ, {bridge.HOST_PIPE_ENV: "test-pipe"}):
+            with patch.object(bridge, "dispatch_wake", fake_dispatch):
+                bridge.deliver_new_wakes(self.state, seen)
+                bridge.deliver_new_wakes(self.state, seen)
+        self.assertEqual(delivered, [event_id])
+        self.assertNotIn(old_event, delivered)
+        self.assertNotIn(manual_probe, delivered)
+
+    def test_codex_runner_delivers_event_created_during_lite_turn(self):
+        con = bridge.connect(self.state)
+        try:
+            con.execute("INSERT INTO meta(key,value) VALUES ('codex_thread',?)",
+                        ("11111111-1111-4111-8111-111111111111",))
+        finally:
+            con.close()
+        created = []
+        delivered = []
+
+        def fake_request(method, path, payload=None, timeout=35):
+            if path == "/api/bridge/turn/start":
+                return {"sessionId": "real-session", "turnId": "bt-test", "observedModel": "swe-2-high",
+                        "modelEvidence": "set-request"}
+            self.assertIn("waitMs=5000", path)
+            con = bridge.connect(self.state)
+            try:
+                with bridge.transaction(con):
+                    created.append(bridge.new_wake(con, self.state, "completion", self.actor_id,
+                                                   "r-test", "done"))
+            finally:
+                con.close()
+            return {"status": "done", "sessionId": "real-session"}
+
+        def fake_dispatch(state, event_id):
+            delivered.append(event_id)
+            return {"status": "host_accepted", "event_id": event_id}
+
+        with patch.dict(os.environ, {bridge.HOST_PIPE_ENV: "test-pipe"}):
+            with patch.object(bridge, "admit_swe", self.admitted):
+                with patch.object(bridge, "lite_request", fake_request):
+                    with patch.object(bridge, "dispatch_wake", fake_dispatch):
+                        bridge.run_lite_turn(self.state, self.actor_id, self.token,
+                                             self.turn_id, self.actor, self.turn)
+        self.assertEqual(delivered, created)
+
+    def test_rejected_new_wake_is_not_retried_in_same_runner(self):
+        con = bridge.connect(self.state)
+        try:
+            con.execute("INSERT INTO meta(key,value) VALUES ('codex_thread',?)",
+                        ("11111111-1111-4111-8111-111111111111",))
+        finally:
+            con.close()
+        seen = bridge.wake_ids(self.state)
+        con = bridge.connect(self.state)
+        try:
+            with bridge.transaction(con):
+                event_id = bridge.new_wake(con, self.state, "completion", self.actor_id, "r-test")
+        finally:
+            con.close()
+        with patch.dict(os.environ, {bridge.HOST_PIPE_ENV: "test-pipe"}):
+            with patch.object(bridge, "dispatch_wake",
+                              return_value={"status": "pending", "error": "host rejected"}) as dispatch:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    bridge.deliver_new_wakes(self.state, seen)
+                    bridge.deliver_new_wakes(self.state, seen)
+        dispatch.assert_called_once_with(self.state, event_id)
+
 
 class SubagentReservationTests(unittest.TestCase):
     def setUp(self):

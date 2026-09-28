@@ -76,6 +76,8 @@ node server.mjs 9000   :: 自定义端口
 
 Codex 的 `devin-session-collaboration` 桥梁默认连接本机 Lite 的 `/api/bridge/turn/start|status`，经这个服务的单个常驻 `devin acp` 创建或续跑 SWE 会话；因此 GUI 和桥梁看见同一批会话与运行状态。桥梁的 `--cwd` 只决定会话工作目录，任务文件正文才是发给 Devin 的 prompt；使用项目或独立 checkout 根目录作 `--cwd`，避免任务区被误列为工作区。Lite 不可达时桥梁会明确失败，不自动另起 Devin。回合完成后桥梁保留自身邮箱、报告和验收记录。桥梁的取消请求按 host turn 定位；同会话另有 GUI 插话时，后端会拒绝可能波及插话的会话级取消。
 
+Devin 向原 Codex 聊天发 `send --direct`、`report --final` 或 `block` 时先写入桥梁事件；由继承 Codex app-tools pipe 的桥梁 runner 投递本轮新增事件。Lite 内的 Devin ACP 不持有该 pipe。既有待发事件及宿主拒绝后的事件不自动重试，可用 `wake-status` 核对后显式 `wake-retry`；宿主接受与原聊天实际收到分别记录。
+
 外部主控对已有 Devin 会话发 `send --action` 时，桥梁启动独立的直发跟踪进程，不等待该 actor 的普通 runner；消息与结果仍记录在同一个任务库。Devin 同级 action 与新会话继续遵守 5 条并发准入。ACP 接受并行 prompt 只证明请求已投递，具体何时被模型应用仍以真实回合结果为准。
 
 桥梁 `capacity` 命令直接返回当前 `active/limit/available`；`start` 也自动附容量快照，5/5 时不创建新会话。Codex 可据此改选原生子代理；Devin 内部 `run_subagent` 必须先用 `swe_subagents.py reserve` 预留名额，满额时由当前 Devin 会话自己完成任务。预留在子代理结束或启动失败后用 `done` 释放。

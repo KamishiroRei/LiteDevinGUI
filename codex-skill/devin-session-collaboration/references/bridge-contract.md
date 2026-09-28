@@ -32,7 +32,7 @@
 
 ## 原聊天事件边界
 
-Codex 派单后轻量确认任务正常启动、无明显运行故障即可放手；SWE 异步自主执行。Codex 有独立工作照常做，无事直接结束当前轮进入 idle，不持续监视、轮询或阻塞等待完成。SWE 自主执行和内部核验，有行动价值的协作消息可显式 `send --direct`；需主控整合的受委派任务完成用 `report --final`，真实阻塞用 `block`。未配置现有 Codex thread UUID 时，普通消息和报告仅保存到持久邮箱，三种直达命令则明确报错。已配置时，直达命令同事务保存事件，再经当前环境的 `CODEX_APP_TOOLS_PIPE_PATH` 调宿主 `codex_app/send_message_to_thread`，目标为事件中原线程 UUID。发信正文含事件索引和最多 2000 字符的实际消息/报告/阻塞内容；全文留在任务邮箱或报告。该入口与 Codex Agent 会话间发信同源；桥梁不再使用 CLI queue，也不在宿主失败后退回 queue。pipe 缺失/明确拒绝保留 `pending`，请求写出后无确定答复保留 `attempting`，宿主接受记 `submitted`，原聊天收到后才记 `received`。具体命令和恢复见 bridge-cli.md。
+Codex 派单后轻量确认任务正常启动、无明显运行故障即可放手；SWE 异步自主执行。Codex 有独立工作照常做，无事直接结束当前轮进入 idle，不持续监视、轮询或阻塞等待完成。SWE 自主执行和内部核验，有行动价值的协作消息可显式 `send --direct`；需主控整合的受委派任务完成用 `report --final`，真实阻塞用 `block`。未配置现有 Codex thread UUID 时，普通消息和报告仅保存到持久邮箱，三种直达命令则明确报错。已配置时，直达命令同事务保存事件；持有 `CODEX_APP_TOOLS_PIPE_PATH` 的 Codex 桥梁 runner 轮询本轮新增事件，调宿主 `codex_app/send_message_to_thread`，目标为事件中原线程 UUID。Lite 持有的 Devin ACP 不继承此 pipe。发信正文含事件索引和最多 2000 字符的实际消息/报告/阻塞内容；全文留在任务邮箱或报告。该入口与 Codex Agent 会话间发信同源；桥梁不再使用 CLI queue，也不在宿主失败后退回 queue。无 runner、pipe 缺失或明确拒绝保留 `pending`，不自动重发旧事件或同一轮遭拒事件；请求写出后无确定答复保留 `attempting`，宿主接受记 `submitted`，原聊天收到后才记 `received`。具体命令和恢复见 bridge-cli.md。
 
 API 采用 CLI + JSON/文件参数；长任务书使用文件，中文与空格路径必须可靠。桥梁读取任务正文作为 prompt，`--cwd` 只作为会话工作目录；不把正文路径变成 Lite 工作区。禁止把模型文本拼接为 shell 代码；HTTP 用 JSON，不把输入拼成 shell 代码。后台进程隐藏窗口。
 

@@ -433,6 +433,51 @@ def dispatch_wake(state: Path, event_id: str, allow_uncertain: bool = False) -> 
     return {"event_id": event_id, "status": status, "error": error}
 
 
+def submit_wake(state: Path, event_id: str | None) -> dict | None:
+    """A Devin-side command persists its event; the Codex runner delivers it.
+
+    The Lite-owned ACP process cannot inherit the Codex app-tools pipe. Do not
+    count a guaranteed missing pipe as a failed send or replay old events.
+    """
+    if event_id is None:
+        return None
+    if not os.environ.get(HOST_PIPE_ENV, "").strip():
+        return {"event_id": event_id, "status": "pending", "route": "codex_runner"}
+    return dispatch_wake(state, event_id)
+
+
+def wake_ids(state: Path) -> set[str]:
+    with contextlib.closing(connect(state)) as con:
+        ensure_wake_schema(con)
+        return {row[0] for row in con.execute("SELECT id FROM wake_events")}
+
+
+def deliver_new_wakes(state: Path, seen: set[str]) -> None:
+    """Deliver only events created during this Codex-owned runner's lifetime.
+
+    A rejected event stays pending for an explicit retry. Existing pending
+    events are never swept into a new turn automatically.
+    """
+    if not os.environ.get(HOST_PIPE_ENV, "").strip():
+        return
+    with contextlib.closing(connect(state)) as con:
+        ensure_wake_schema(con)
+        pending = [row[0] for row in con.execute(
+            """SELECT id FROM wake_events WHERE status='pending'
+               AND kind IN ('message','completion','blocked') ORDER BY created_at,id""")]
+    for event_id in pending:
+        if event_id in seen:
+            continue
+        seen.add(event_id)
+        try:
+            result = dispatch_wake(state, event_id)
+            if result["status"] not in ("host_accepted", "received"):
+                print(f"Wake event {event_id} delivery {result['status']}: "
+                      f"{result.get('error') or ''}", file=sys.stderr)
+        except BridgeError as exc:
+            print(f"Wake event {event_id} delivery error: {exc}", file=sys.stderr)
+
+
 def run_capture(argv: list[str], cwd: str) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(argv, cwd=cwd, env=cli_env(), stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW)
@@ -713,7 +758,7 @@ def send(args: argparse.Namespace) -> None:
     con.close()
     pid = (spawn_controller_interjection(state, args.recipient, tid) if controller_direct
            else spawn_runner(state, args.recipient) if args.action else None)
-    wake = dispatch_wake(state, wid) if wid else None
+    wake = submit_wake(state, wid)
     out({"message_id": mid, "state": "direct_dispatch" if controller_direct else "saved", "turn_id": tid,
          "runner_pid": pid, "wake": wake})
 
@@ -813,7 +858,7 @@ def report(args: argparse.Namespace) -> None:
                        f"Report {rid} version {version}:\n{summary}", t, rid))
         wid = new_wake(con, state, "completion", args.sender, rid, summary) if args.final else None
     con.close()
-    wake = dispatch_wake(state, wid) if wid else None
+    wake = submit_wake(state, wid)
     out({"report_id": rid, "version": version, "message_id": mid, "state": "submitted",
          "wake": wake})
 
@@ -838,7 +883,7 @@ def block(args: argparse.Namespace) -> None:
                        "block", body, t))
         wid = new_wake(con, state, "blocked", args.sender, mid, body)
     con.close()
-    out({"message_id": mid, "state": "saved", "wake": dispatch_wake(state, wid)})
+    out({"message_id": mid, "state": "saved", "wake": submit_wake(state, wid)})
 
 
 def wake_config(args: argparse.Namespace) -> None:
@@ -1078,6 +1123,7 @@ def run_lite_turn(state: Path, actor_id: str, token: str | None, turn_id: str,
                   a: sqlite3.Row, turn: sqlite3.Row) -> tuple[int, str, str | None]:
     """Run one bridge turn through Lite's single ACP owner, with no CLI peer."""
     prompt = Path(turn["prompt_path"]).read_text(encoding="utf-8")
+    seen_wakes = wake_ids(state)
 
     def capacity_cancelled() -> bool:
         check = connect(state)
@@ -1172,7 +1218,8 @@ def run_lite_turn(state: Path, actor_id: str, token: str | None, turn_id: str,
                 if stopped.get("status") != "cancelled":
                     raise BridgeError(f"Lite did not confirm cancellation of {host_turn_id}: {stopped}")
                 raise CapacityCancelled(f"Cancelled Lite turn {host_turn_id}")
-            query = urllib.parse.urlencode({"turnId": host_turn_id, "waitMs": 20000})
+            query = urllib.parse.urlencode({"turnId": host_turn_id,
+                                            "waitMs": 5000 if os.environ.get(HOST_PIPE_ENV) else 20000})
             try:
                 status = lite_request("GET", "/api/bridge/turn/status?" + query, timeout=30)
             except BridgeError as exc:
@@ -1182,6 +1229,7 @@ def run_lite_turn(state: Path, actor_id: str, token: str | None, turn_id: str,
                 raise BridgeError(f"Unexpected Devin Lite turn status: {status}")
             stdout.write(json.dumps(status, ensure_ascii=False) + "\n")
             stdout.flush()
+            deliver_new_wakes(state, seen_wakes)
             if state_name in ("running", "deferred"):
                 continue
             if state_name == "cancelled":
