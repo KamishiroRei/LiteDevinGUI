@@ -6,7 +6,7 @@
 
 前置：Node.js ≥ 18 + 已登录的 `devin` CLI（`devin` 在 PATH 中，或用 `DEVIN_EXE` 指定）。
 
-双击 **`devin-lite.vbs`**（桌面快捷方式 `devin-lite.lnk` 同效）：幂等——先探测已有服务，已运行则只打开浏览器接入，未运行才拉起服务；无控制台黑窗。
+双击 **`devin-lite.vbs`**（桌面快捷方式 `devin-lite.lnk` 同效）：幂等——先用不触发 ACP 启动的 `/api/health` 探测 Lite 服务，已运行则只打开浏览器接入，未运行才拉起服务；无控制台黑窗。浏览器连接时会启动缺失的 Devin ACP，左下角也可手动启动或重启；正在运行的回合不会被手动重启打断。
 
 或命令行（保留日志窗口）：
 
@@ -46,7 +46,7 @@ node server.mjs 9000   :: 自定义端口
 
 - 打开会话只渲染**最新 2 轮**并沉底；滚到顶部自动向前翻页（每页 5 轮，视口锚定不跳）；快速连点只有最后一次生效（代次守卫）
 - 渲染语义区分：用户气泡 / 助手正文（按 messageId 分气泡，支持表格和复制）/ 可折叠思考 / 工具卡片（kind·标题·状态·参数·diff·终端，点开详情）/ 计划清单 / 权限请求按钮
-- 刷新页面会恢复当前会话，工作区侧栏可收起；亮色与暗色主题可切换并记住选择
+- 刷新页面会恢复当前会话，工作区侧栏可收起；亮色与暗色主题可切换并记住选择。左下角连接状态以 ACP 初始化结果为准，断开后可点重启图标恢复
 - 回合中可继续输入并直接发送插话；「停止」（`session/cancel`）与底部运行指示仍跟随当前会话
 
 **输入**
@@ -70,7 +70,7 @@ node server.mjs 9000   :: 自定义端口
 
 **并发延期队列**
 
-共享并发预算与 Codex 协作桥梁同口径，固定上限 10 条。非运行中会话发送前先做本机容量预检（`swe_capacity.py`：busy 会话＋CLI 实例＋已预留的 subagent）；同一运行中会话的插话直接交给 Devin，不额外等待容量空位。满额时新会话 prompt 进入延期队列，ACP 明确拒绝并发或配额时也会自动入队重发。错误携带分钟、秒数或结构化期限时按 `期限+5s` 定时重发，期限之前不派发；未给期限时按容量与停滞探针节奏检查。队列持久化在 `deferred-prompts.json`，重启自动恢复并保持延期消息的顺序；「停止」会丢弃该会话尚在排队的项目。该队列是尽力而为的本机门禁（不持有全局准入锁），agent 侧的并发拒绝仍是权威兜底。
+共享并发预算与 Codex 协作桥梁同口径，固定上限 10 条。非运行中会话发送前先做本机容量预检（`swe_capacity.py`：busy 会话＋CLI 实例＋已预留的 subagent）；同一运行中会话的插话直接交给 Devin，不额外等待容量空位。满额时新会话 prompt 进入延期队列，ACP 明确拒绝并发或配额时也会自动入队重发。错误携带分钟、秒数或结构化期限时按 `期限+5s` 定时重发；所有被拒绝的消息至少等待 30 秒，未给期限时按 30 秒下限和容量检查节奏重试，期限之前绝不派发。队列持久化在 `deferred-prompts.json`，重启自动恢复并保持延期消息的顺序；恢复发送中的记录时也至少等待 30 秒，避免立刻重复提交。「停止」会丢弃该会话尚在排队的项目。该队列是尽力而为的本机门禁（不持有全局准入锁），agent 侧的并发拒绝仍是权威兜底。
 
 **Codex 协作统一入口**
 
@@ -105,6 +105,7 @@ Codex 的 `devin-session-collaboration` 桥梁默认连接本机 Lite 的 `/api/
 | `codex-skill/devin-session-collaboration/` | 可追踪的 CODEX 协作手册、统一入口桥梁与契约检查；同步安装到本机 Codex skills 目录 |
 | `devin-lite.vbs` | 幂等静默启动器（先探测后拉起） |
 | `devin-lite.bat` | 控制台启动器（保留日志） |
+| `tests/retry-recovery.mjs` | 独立假 ACP 回归测试：单进程恢复、手动重启和并发重试期限 |
 | `tools/probe-resume.mjs` | ACP 会话锁/方法探测脚本（调试参考） |
 | `deferred-prompts.json` | 并发延期队列持久化（运行期生成） |
 | `archived-sessions.json` | 本机服务的会话归档元数据（运行期生成） |
@@ -119,10 +120,14 @@ Codex 的 `devin-session-collaboration` 桥梁默认连接本机 Lite 的 `/api/
 | `WINDSURF_API_KEY` | 认证回退（否则读 devin `credentials.toml`） |
 | `DEVIN_LITE_CAPACITY_SCRIPT` | 容量检查脚本（默认 `swe_capacity.py` 的协作技能路径） |
 | `DEVIN_LITE_PYTHON` | 跑容量脚本的解释器（默认 `python`） |
-| `DEVIN_LITE_RETRY_POLL_MS` | 队列轮询间隔（默认 60000，范围 15s–10min） |
+| `DEVIN_LITE_RETRY_POLL_MS` | 容量受阻时队列复查间隔（默认 30000，范围 30s–10min；后端明确期限独立于此间隔） |
 | `DEVIN_LITE_PROBE_AFTER_MS` | 容量读不出时的停滞探针等待（默认 300000） |
 | `DEVIN_LITE_CONCURRENCY_RE` | 并发拒绝的识别正则（覆盖默认模式时设） |
 
+## 回归验证
+
+运行 `node tests/retry-recovery.mjs`。脚本把服务端复制到独立临时目录并使用假 ACP 与容量桩，不读取生产会话和延期队列；验证 1/2 分钟提示、无提示时 30 秒下限、到期后重发、启动恢复与忙时重启保护。
+
 ## REST 一览（给其他客户端复用同一 acp 实例）
 
-`GET /api/status` · `GET /api/sessions` · `GET /api/archived` · `POST /api/sessions/new|load|archive|unarchive|delete|mode|config` · `GET /api/history` · `GET /api/session-images` · `GET /api/image-preview` · `POST /api/prompt` · `POST /api/cancel` · `POST /api/permission` · `POST /api/pick-folder` · `POST /api/pick-file` · `POST /api/clipboard-files` · `POST /api/attach` · `POST /api/bridge/turn/start|cancel` · `GET /api/bridge/turn/status` · `GET /api/queue` · `POST /api/queue/drop` · `GET /api/capacity` · `GET /api/events`（SSE：update/busy/permission/prompt-done/prompt-deferred/prompt-dispatch/bridge-turn/queue/session-archived）
+`GET /api/health|status` · `POST /api/agent/restart` · `GET /api/sessions` · `GET /api/archived` · `POST /api/sessions/new|load|archive|unarchive|delete|mode|config` · `GET /api/history` · `GET /api/session-images` · `GET /api/image-preview` · `POST /api/prompt` · `POST /api/cancel` · `POST /api/permission` · `POST /api/pick-folder` · `POST /api/pick-file` · `POST /api/clipboard-files` · `POST /api/attach` · `POST /api/bridge/turn/start|cancel` · `GET /api/bridge/turn/status` · `GET /api/queue` · `POST /api/queue/drop` · `GET /api/capacity` · `GET /api/events`（SSE：update/busy/permission/prompt-done/prompt-deferred/prompt-dispatch/bridge-turn/queue/session-archived/agent-ready/agent-down）

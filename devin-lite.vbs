@@ -10,7 +10,7 @@ sh.CurrentDirectory = dir
 alive = False
 On Error Resume Next
 Set http = CreateObject("MSXML2.XMLHTTP")
-http.Open "GET", "http://127.0.0.1:8317/api/status", False
+http.Open "GET", "http://127.0.0.1:8317/api/health", False
 http.Send
 If Err.Number = 0 And http.Status = 200 Then alive = True
 On Error Goto 0

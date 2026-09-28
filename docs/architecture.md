@@ -19,7 +19,7 @@
 | 请求路由 | REST 端点、静态文件与 SSE 连接 | `server.mjs` 的 `routes`、`http.createServer` |
 | 桥梁权限 | 桥接会话使用 bypass，权限请求按允许选项自动应答；GUI 会话保持人工权限 UI | `server.mjs` 的 `autoApproveSessions`、`session/request_permission` 处理 |
 | 输入辅助 | Windows 原生目录/文件/剪贴板选择 | `server.mjs` 的 `pickFolderNative`、`pickFileNative`、`clipboardFilesNative` |
-| 生命周期 | 启动器复用现役 Lite 服务；宿主启动检查、子进程归属与退出清理 | `server.mjs` 的 `killTree`、`shutdownChild` |
+| 生命周期 | 启动器经不触发 ACP 的健康探针复用现役 Lite；网页打开时单飞启动缺失的 ACP，初始化限时；ACP 退出时拒绝全部在途请求；闲置时可手动重启，忙碌时拒绝重启 | `server.mjs` 的 `DevinAcp.ensure`、`DevinAcp.teardown`、`DevinAcp.restart`、`GET /api/health`、`POST /api/agent/restart`、`shutdownChild`；`devin-lite.vbs` |
 
 ## 会话与历史
 
@@ -47,8 +47,8 @@
 | 模块 | 功能 | 源码定位 |
 |---|---|---|
 | 容量读取 | 调用共享 SWE 容量脚本，按固定 10 条上限给出当前可用名额 | `server.mjs` 的 `capacitySnapshot`；`swe_capacity.py` 的 `limit` |
-| 错误期限 | 从 Devin 并发或配额错误提取重发时间 | `server.mjs` 的 `parseRetryAfterMs` |
-| 队列状态 | 持久化待发送及发送中状态，对外提供列表和撤销尚未派发的项 | `server.mjs` 的 `loadQueue`、`saveQueue`、`queueView`、`GET /api/queue`、`POST /api/queue/drop` |
+| 错误期限 | 从 Devin 并发或配额错误提取重发时间，包括 `limit will reset in 1 minute`；解析不到时至少等 30 秒 | `server.mjs` 的 `parseRetryAfterMs`、`MIN_RETRY_MS` |
+| 队列状态 | 持久化待发送及发送中状态；重启后把发送中记录转为延期，至少等 30 秒再派发；对外提供列表和撤销尚未派发的项 | `server.mjs` 的 `loadQueue`、`saveQueue`、`queueView`、`GET /api/queue`、`POST /api/queue/drop` |
 | 调度 | 到期与容量判断后重新进入同一会话 prompt | `server.mjs` 的 `deferPrompt`、`schedulePump`、`pumpDeferred`、`dispatchPrompt` |
 | 状态显示 | SSE 加载/完成事件、侧栏计数、倒计时与取消 | `public/app.js` 的 `connectEvents`、`refreshQueue`、`updateQueueBanner` |
 
@@ -57,6 +57,7 @@
 | 模块 | 功能 | 源码定位 |
 |---|---|---|
 | 页面骨架 | 工作区导航、会话内容、输入和状态区域 | `public/index.html` |
+| ACP 连接状态 | SSE 连接仅表示 Lite 服务在线；ACP 初始化成功才显示 Devin 在线，左下角按钮可启动或重启 | `public/app.js` 的 `showAgentOnline`、`showAgentOffline`、`restartAgent`、`connectEvents` |
 | 页面主题 | 亮/暗主题、移动端布局、图标和状态样式 | `public/app.css`、`public/favicon.svg` |
 | 消息呈现 | ACP 语义更新转为回复、思考、工具、计划和权限卡片 | `public/app.js` 的 `renderUpdate`、`appendAgentText`、`toolCard`、`renderPermission` |
 | 输入与路径 | 磁盘文件直接引用原路径；剪贴板位图二进制落盘；输入区显示图片标签，发送时展开为纯文本路径 | `public/app.js` 的 `beginPathInsert`、`beginImageRef`、`uploadImageRef`、`send`；`server.mjs` 的 `clipboardFilesNative`、`pickFileNative`、`POST /api/attach` |

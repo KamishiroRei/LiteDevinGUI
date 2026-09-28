@@ -238,8 +238,8 @@ details.toolrun .tr-body .tool { margin: 0; }
 .group-more { padding: 5px 10px; }
 #moreBtn { border-radius: 8px; background: var(--bg); }
 .side-footer { min-height: 45px; display: flex; align-items: center; gap: 8px; padding: 7px 13px; border-top: 1px solid var(--border); }
-.side-footer .agent { color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.side-footer #themeBtn { margin-left: auto; flex: none; }
+.side-footer .agent { flex: 1; min-width: 0; color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.side-footer #restartAgentBtn, .side-footer #themeBtn { flex: none; }
 .connection-dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--yellow); }
 .connection-dot.online { background: var(--green); }
 .connection-dot.offline { background: var(--red); }

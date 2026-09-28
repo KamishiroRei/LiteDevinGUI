@@ -1814,9 +1814,42 @@ function setBusy(on) {
   }
 }
 
+function showAgentOnline(info) {
+  $('agentInfo').textContent = `${info?.name ?? 'devin'} ${info?.version ?? ''}`.trim()
+  $('agentInfo').style.color = ''
+  $('connectionDot').className = 'connection-dot online'
+  $('restartAgentBtn').title = '重启 Devin（运行中的回合不可重启）'
+}
+
+function showAgentOffline(message) {
+  $('agentInfo').textContent = message ? `Devin 不可用：${message}` : 'Devin 未连接'
+  $('agentInfo').style.color = 'var(--red)'
+  $('connectionDot').className = 'connection-dot offline'
+  $('restartAgentBtn').title = '启动 Devin'
+}
+
+async function restartAgent() {
+  const button = $('restartAgentBtn')
+  button.disabled = true
+  try {
+    const status = await api('POST', '/api/agent/restart')
+    showAgentOnline(status.agentInfo)
+    await Promise.all([refreshSessions(), refreshQueue(), refreshCapacity()])
+    if (state.active) await openSession(state.active)
+    toast('Devin 已连接')
+  } catch (error) {
+    if (!error.message.includes('正在处理回合')) showAgentOffline(error.message)
+    toast(`无法重启 Devin：${error.message}`, 'error')
+  } finally {
+    button.disabled = false
+  }
+}
+
 function connectEvents() {
   const es = new EventSource('/api/events')
-  es.onopen = () => { $('connectionDot').className = 'connection-dot online' }
+  // SSE means the Lite host is reachable; only ACP initialization proves
+  // that Devin itself is connected. Reconnect also revives a missing child.
+  es.onopen = () => { void api('GET', '/api/status').then(s => showAgentOnline(s.agentInfo)).catch(e => showAgentOffline(e.message)) }
   es.onmessage = (e) => {
     let ev
     try { ev = JSON.parse(e.data) } catch { return }
@@ -1872,12 +1905,16 @@ function connectEvents() {
         else if (ev.stopReason && ev.stopReason !== 'end_turn') addNote(`回合结束：${ev.stopReason}`, 'warn')
         break
       }
-      case 'agent-down': toast(`Devin CLI 已退出：${ev.message}。请刷新页面后重试。`, 'error'); break
+      case 'agent-down':
+        showAgentOffline(ev.message)
+        toast(`Devin CLI 已退出：${ev.message}。可点左下角重启按钮恢复。`, 'error')
+        break
+      case 'agent-ready': showAgentOnline(ev.agentInfo); break
       case 'queue': void refreshQueue(); break
       default: break
     }
   }
-  es.onerror = () => { $('connectionDot').className = 'connection-dot offline' } // EventSource auto-reconnects
+  es.onerror = () => { showAgentOffline('Lite 服务连接中断') } // EventSource auto-reconnects
 
   // Busy/lock state lives on other processes too — refresh the list snapshot
   // periodically so running indicators and relative times stay truthful.
@@ -1946,6 +1983,7 @@ document.addEventListener('pointerdown', e => {
 $('newBtn').addEventListener('click', () => { void refreshCapacity(); void newSession() })
 $('newBtn').addEventListener('pointerenter', () => { void refreshCapacity() })
 $('reloadBtn').addEventListener('click', () => { void Promise.all([refreshSessions(), refreshArchives()]) })
+$('restartAgentBtn').addEventListener('click', () => { void restartAgent() })
 $('moreBtn').addEventListener('click', () => refreshSessions(true))
 $('activeSessionsTab').addEventListener('click', () => setSessionView('active'))
 $('archivedSessionsTab').addEventListener('click', () => setSessionView('archived'))
@@ -1974,8 +2012,7 @@ $('transcript').addEventListener('scroll', () => {
   connectEvents()
   try {
     const status = await api('GET', '/api/status')
-    $('agentInfo').textContent = `${status.agentInfo.name ?? 'devin'} ${status.agentInfo.version ?? ''}`
-    $('connectionDot').className = 'connection-dot online'
+    showAgentOnline(status.agentInfo)
     await Promise.all([refreshSessions(), refreshQueue(), refreshCapacity()])
     void refreshArchives()
     try {
@@ -1986,9 +2023,7 @@ $('transcript').addEventListener('scroll', () => {
       }
     } catch { localStorage.removeItem('devin-lite:active') }
   } catch (err) {
-    void refreshArchives() // server archive metadata is readable even if ACP is down
-    $('agentInfo').textContent = `devin acp 不可用：${err.message}`
-    $('agentInfo').style.color = 'var(--red)'
-    $('connectionDot').className = 'connection-dot offline'
+    void Promise.all([refreshArchives(), refreshQueue(), refreshCapacity()]) // these work without ACP
+    showAgentOffline(err.message)
   }
 })()

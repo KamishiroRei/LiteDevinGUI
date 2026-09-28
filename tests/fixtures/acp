@@ -1,0 +1,78 @@
+// Fake `devin acp` agent for devin-lite isolated testing (CommonJS — spawned
+// as `node acp` with cwd=this dir). Behavior is driven by fake-state.json,
+// rewritten by the test harness between phases. Every session/prompt call is
+// appended to prompt-log.jsonl with an epoch-ms timestamp so the harness can
+// verify dispatch timing (e.g. "never before the advertised wait deadline").
+const readline = require('readline')
+const fs = require('fs')
+const path = require('path')
+
+const DIR = __dirname
+const STATE = path.join(DIR, 'fake-state.json')
+const PROMPT_LOG = path.join(DIR, 'prompt-log.jsonl')
+const START_LOG = path.join(DIR, 'acp-start-log.jsonl')
+fs.appendFileSync(START_LOG, JSON.stringify({ at: Date.now(), pid: process.pid }) + '\n')
+
+function state() {
+  try { return JSON.parse(fs.readFileSync(STATE, 'utf8')) } catch { return {} }
+}
+
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', (line) => {
+  let m
+  try { m = JSON.parse(line) } catch { return }
+  if (m.id === undefined) return // notifications (session/cancel) — accept silently
+  const respond = (r) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, ...r }) + '\n')
+  const st = state()
+  switch (m.method) {
+    case 'initialize':
+      respond({ result: { protocolVersion: 1, agentCapabilities: { loadSession: true }, authMethods: [], agentInfo: { name: 'fake-devin', version: 'test' } } })
+      break
+    case 'authenticate':
+      respond({ result: {} })
+      break
+    case 'session/new':
+      respond({ result: { sessionId: `s-new-${Date.now()}` } })
+      break
+    case 'session/load':
+      respond({ result: {} })
+      break
+    case 'session/list': {
+      const all = st.sessions ?? []
+      const pageSize = st.pageSize ?? 100
+      const idx = m.params?.cursor !== undefined ? Number(m.params.cursor) : 0
+      const page = all.slice(idx, idx + pageSize)
+      const result = { sessions: page }
+      if (idx + pageSize < all.length) result.nextCursor = String(idx + pageSize)
+      respond({ result })
+      break
+    }
+    case 'session/delete':
+      respond({ result: {} })
+      break
+    case 'session/set_mode':
+    case 'session/set_config_option':
+      respond({ result: {} })
+      break
+    case 'session/prompt': {
+      const entry = {
+        at: Date.now(),
+        sessionId: m.params?.sessionId,
+        text: (m.params?.prompt ?? []).filter(p => p.type === 'text').map(p => p.text).join(''),
+      }
+      fs.appendFileSync(PROMPT_LOG, JSON.stringify(entry) + '\n')
+      const mode = st.promptMode ?? 'ok'
+      if (mode === 'hang') {
+        break
+      }
+      if (mode === 'reject') {
+        respond({ error: { code: -32003, message: st.rejectMessage ?? 'concurrency limit reached', ...(st.rejectData !== undefined ? { data: st.rejectData } : {}) } })
+      } else {
+        respond({ result: { stopReason: 'end_turn' } })
+      }
+      break
+    }
+    default:
+      respond({ error: { code: -32601, message: `fake-devin: unhandled ${m.method}` } })
+  }
+})

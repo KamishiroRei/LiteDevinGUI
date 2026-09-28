@@ -49,8 +49,10 @@ const CAPACITY_SCRIPT = process.env.DEVIN_LITE_CAPACITY_SCRIPT
 const CAPACITY_PYTHON = process.env.DEVIN_LITE_PYTHON ?? 'python'
 /** Fixed ten-slot bound, matching the shared admission rule. */
 const CAPACITY_FALLBACK_LIMIT = 10
-/** How often the deferred queue rechecks capacity. */
-const RETRY_POLL_MS = Math.min(600_000, Math.max(15_000, Number(process.env.DEVIN_LITE_RETRY_POLL_MS ?? 60_000)))
+/** Never submit a rejected prompt again before this interval. */
+const MIN_RETRY_MS = 30_000
+/** How often a capacity-blocked queue rechecks the shared slot count. */
+const RETRY_POLL_MS = Math.min(600_000, Math.max(MIN_RETRY_MS, Number(process.env.DEVIN_LITE_RETRY_POLL_MS ?? MIN_RETRY_MS)))
 /** After this long with no readable capacity, try one deferred prompt anyway —
  * the agent's own rejection is the authoritative full/empty signal. */
 const PROBE_AFTER_MS = Math.min(3_600_000, Math.max(60_000, Number(process.env.DEVIN_LITE_PROBE_AFTER_MS ?? 300_000)))
@@ -81,6 +83,7 @@ class DevinAcp {
   authMethods = []
   authed = false
   starting = undefined
+  restarting = undefined
   /** sessionId -> cwd for sessions loaded/created in this process. */
   loaded = new Map()
   /**
@@ -114,11 +117,42 @@ class DevinAcp {
     this.child?.stdin.write(JSON.stringify(message) + '\n')
   }
 
-  request(method, params) {
+  request(method, params, timeoutMs = 0) {
+    const child = this.child
+    if (child === undefined || child.killed || child.exitCode !== null || child.stdin.destroyed) {
+      return Promise.reject(Object.assign(new Error('devin acp is not running'), { agentDown: true }))
+    }
     const id = `c-${++this.nextId}`
     return new Promise((resolvePromise, reject) => {
-      this.pending.set(id, { resolve: resolvePromise, reject })
-      this.send({ jsonrpc: '2.0', id, method, params })
+      let timer
+      const clear = () => { if (timer !== undefined) clearTimeout(timer) }
+      this.pending.set(id, {
+        resolve: (value) => { clear(); resolvePromise(value) },
+        reject: (error) => { clear(); reject(error) },
+      })
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          if (!this.pending.has(id)) return
+          this.pending.delete(id)
+          const error = Object.assign(new Error(`${method} timed out after ${timeoutMs}ms`), { agentDown: true })
+          reject(error)
+          if (this.child === child) {
+            this.teardown(child, error)
+            if (Number.isInteger(child.pid)) killTree(child.pid)
+          }
+        }, timeoutMs)
+      }
+      const failWrite = (error) => {
+        if (!this.pending.has(id)) return
+        const failure = Object.assign(error, { agentDown: true })
+        this.teardown(child, failure)
+        if (Number.isInteger(child.pid)) killTree(child.pid)
+      }
+      try {
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n', (error) => {
+          if (error) failWrite(error)
+        })
+      } catch (error) { failWrite(error) }
     })
   }
 
@@ -181,7 +215,8 @@ class DevinAcp {
   }
 
   async ensure() {
-    if (this.child !== undefined) return
+    if (this.starting !== undefined) return this.starting
+    if (this.child !== undefined && !this.child.killed && this.child.exitCode === null) return
     this.starting ??= this.spawn()
     try {
       await this.starting
@@ -219,40 +254,85 @@ class DevinAcp {
     })
     child.on('error', (error) => {
       log('devin spawn error:', error.message)
-      this.teardown(error)
+      this.teardown(child, error)
     })
     child.on('close', (code, signal) => {
       log('devin acp exited', code ?? signal)
-      this.teardown(new Error(`devin acp exited (code ${code ?? signal})`))
+      this.teardown(child, Object.assign(new Error(`devin acp exited (code ${code ?? signal})`), { agentDown: true }))
     })
     const rl = createInterface({ input: child.stdout })
-    rl.on('line', (line) => this.onLine(line))
+    rl.on('line', (line) => { if (this.child === child) this.onLine(line) })
 
-    const init = await this.request('initialize', {
-      protocolVersion: 1,
-      clientCapabilities: {},
-      clientInfo: { name: 'devin-lite', version: '0.1.0' },
-    })
-    this.capabilities = init.agentCapabilities ?? {}
-    this.authMethods = init.authMethods ?? []
-    this.agentInfo = init.agentInfo ?? {}
-    log('devin acp ready:', this.agentInfo.name ?? 'agent', this.agentInfo.version ?? '')
+    try {
+      const init = await this.request('initialize', {
+        protocolVersion: 1,
+        clientCapabilities: {},
+        clientInfo: { name: 'devin-lite', version: '0.1.0' },
+      }, 15_000)
+      if (this.child !== child) throw Object.assign(new Error('devin acp exited during initialize'), { agentDown: true })
+      this.capabilities = init.agentCapabilities ?? {}
+      this.authMethods = init.authMethods ?? []
+      this.agentInfo = init.agentInfo ?? {}
+      log('devin acp ready:', this.agentInfo.name ?? 'agent', this.agentInfo.version ?? '')
+      this.emit({ kind: 'agent-ready', agentInfo: this.agentInfo })
+    } catch (error) {
+      if (this.child === child) {
+        this.teardown(child, error)
+        if (Number.isInteger(child.pid)) killTree(child.pid)
+      }
+      throw error
+    }
   }
 
-  teardown(error) {
-    const childPid = this.child?.pid
-    const failed = this.pending
+  teardown(child, error) {
+    if (this.child !== child) return
+    const childPid = child.pid
+    // Snapshot before clear(): retaining the Map itself would empty `failed`
+    // too, leaving every in-flight request hung after an ACP crash.
+    const failed = [...this.pending.values()]
     this.pending.clear()
     this.inbound.clear()
     this.loaded.clear()
     this.histories.clear()
     this.loading.clear()
+    this.echoPending.clear()
     this.child = undefined
+    this.authed = false
+    this.agentInfo = {}
+    this.capabilities = {}
+    this.authMethods = []
     try {
       if (childPid !== undefined && readFileSync(PID_FILE, 'utf8').trim() === String(childPid)) unlinkSync(PID_FILE)
     } catch { /* marker already gone */ }
-    for (const { reject } of failed.values()) reject(error)
+    for (const { reject } of failed) reject(error)
     this.emit({ kind: 'agent-down', message: String(error.message ?? error) })
+  }
+
+  /** Recycle only this server's own idle ACP child; a disconnected child starts fresh. */
+  async restart() {
+    if (this.restarting !== undefined) return this.restarting
+    this.restarting = (async () => {
+      if (this.starting !== undefined) await this.starting.catch(() => {})
+      const child = this.child
+      if (child !== undefined) {
+        if (this.busy.size > 0) throw httpError(409, 'Devin 正在处理回合，请等待完成后再重启')
+        const closed = new Promise((resolveClosed) => {
+          let timer
+          const done = () => { clearTimeout(timer); resolveClosed() }
+          child.once('close', done)
+          timer = setTimeout(() => { child.off('close', done); resolveClosed() }, 2_000)
+        })
+        try { child.stdin.end() } catch { /* the child may already be closing */ }
+        await closed
+        if (this.child === child) {
+          if (Number.isInteger(child.pid)) killTree(child.pid)
+          this.teardown(child, Object.assign(new Error('Devin ACP restarted'), { agentDown: true }))
+        }
+      }
+      await this.ensure()
+      return { agentInfo: this.agentInfo, capabilities: this.capabilities, authed: this.authed }
+    })()
+    try { return await this.restarting } finally { this.restarting = undefined }
   }
 
   onLine(line) {
@@ -609,10 +689,16 @@ function loadQueue() {
     const raw = JSON.parse(readFileSync(QUEUE_FILE, 'utf8'))
     if (!Array.isArray(raw)) return []
     // History buffers were rebuilt from the agent on restart, so the message
-    // needs committing again at dispatch time; a 'sending' entry at shutdown
-    // reverts to 'queued' and is retried.
+    // needs committing again at dispatch time. An in-flight attempt has an
+    // uncertain outcome; never replay it immediately after server recovery.
     return raw.filter(e => typeof e?.sessionId === 'string')
-      .map(e => ({ ...e, committed: false, state: 'queued' }))
+      .map(e => ({
+        ...e, committed: false, state: 'queued',
+        retryAt: Math.max(
+          Number.isFinite(Number(e.retryAt)) ? Number(e.retryAt) : 0,
+          e.state === 'sending' ? Date.now() + MIN_RETRY_MS : (Number(e.lastAttemptAt) || 0) + MIN_RETRY_MS,
+        ),
+      }))
   } catch (error) {
     if (error?.code !== 'ENOENT' && existsSync(QUEUE_FILE)) salvageCorrupt(QUEUE_FILE, 'queue')
     return []
@@ -688,7 +774,7 @@ function parseRetryAfterMs(error) {
     }
   }
   const message = String(error?.message ?? error ?? '')
-  if (/retry|again|wait|重试|稍后|稍候|稍等|等待|after|later|后|分钟/i.test(message)) {
+  if (/retry|again|wait|reset|limit|重试|稍后|稍候|稍等|等待|恢复|after|later|后|分钟/i.test(message)) {
     const unit = /(\d+(?:\.\d+)?)\s*(milliseconds?|msecs?|minutes?|mins?|seconds?|secs?|hours?|hrs?|hr|ms|min|sec|m|s|h|毫秒|分钟|小时|秒|分)(?![a-zA-Z])/i.exec(message)
     if (unit) {
       const n = Number(unit[1])
@@ -728,7 +814,7 @@ function commitDeferred(entry) {
 function deferPrompt(entry, reason, retryAfterMs) {
   entry.queueId ??= `q-${Date.now()}-${++deferredSeq}`
   entry.lastError = String(reason)
-  entry.retryAt = Number.isFinite(retryAfterMs) ? Date.now() + retryAfterMs : Date.now()
+  entry.retryAt = Date.now() + Math.max(MIN_RETRY_MS, Number.isFinite(retryAfterMs) ? retryAfterMs : 0)
   entry.state = 'queued'
   commitDeferred(entry)
   // A re-deferred entry keeps its position so a session's queued messages
@@ -823,7 +909,8 @@ async function dispatchPrompt(entry) {
 
 let pumpTimer
 function schedulePump() {
-  if (pumpTimer !== undefined || deferred.length === 0) return
+  if (pumpTimer !== undefined) { clearTimeout(pumpTimer); pumpTimer = undefined }
+  if (deferred.length === 0) return
   const now = Date.now()
   let wake = Infinity
   for (const e of deferred) {
@@ -838,7 +925,7 @@ function schedulePump() {
     if (term < wake) wake = term
   }
   if (!Number.isFinite(wake)) return
-  const delay = Math.max(1_000, Math.min(RETRY_POLL_MS, wake - now))
+  const delay = Math.max(1_000, Math.min(2_147_483_647, wake - now))
   pumpTimer = setTimeout(() => { pumpTimer = undefined; void pumpDeferred() }, delay)
 }
 
@@ -1040,6 +1127,12 @@ const MIME = {
 }
 
 const routes = {
+  /** Pure host liveness check: launcher must not spawn ACP just to find Lite. */
+  'GET /api/health': async () => ({
+    ok: true,
+    agent: acp.starting !== undefined ? 'starting' : acp.child === undefined ? 'stopped' : 'running',
+  }),
+
   'GET /api/status': async () => {
     await acp.ensure()
     return {
@@ -1048,6 +1141,8 @@ const routes = {
       authed: acp.authed,
     }
   },
+
+  'POST /api/agent/restart': async () => acp.restart(),
 
   /**
    * Session list passthrough with server-side flags: `_busy` (a turn is
