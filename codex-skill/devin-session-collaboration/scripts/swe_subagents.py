@@ -38,21 +38,26 @@ def write_entry(agent_id, parent, title, host_pid):
 
 
 def cmd_reserve(args):
-    with admission_lock():
-        state = snapshot()
-        cap = limit()
-        if state['active'] >= cap:
-            print(json.dumps({'admitted': False, 'active': state['active'],
-                              'limit': cap, 'available': 0,
-                              'action': 'self_execute'}, ensure_ascii=False))
-            return 2
-        token = 'r_' + uuid.uuid4().hex[:16]
-        entry = write_entry(token, args.parent, args.title, args.host_pid)
-        print(json.dumps({'admitted': True, 'reservation_id': token,
-                          'entry': entry, 'active_after': state['active'] + 1,
-                          'limit': cap, 'available_after': cap - state['active'] - 1},
-                         ensure_ascii=False))
-        return 0
+    try:
+        with admission_lock():
+            state = snapshot()
+            cap = limit()
+            if state['active'] >= cap:
+                print(json.dumps({'admitted': False, 'active': state['active'],
+                                  'limit': cap, 'available': 0,
+                                  'action': 'self_execute'}, ensure_ascii=False))
+                return 2
+            token = 'r_' + uuid.uuid4().hex[:16]
+            entry = write_entry(token, args.parent, args.title, args.host_pid)
+            print(json.dumps({'admitted': True, 'reservation_id': token,
+                              'entry': entry, 'active_after': state['active'] + 1,
+                              'limit': cap, 'available_after': cap - state['active'] - 1},
+                             ensure_ascii=False))
+            return 0
+    except Exception as exc:
+        print(json.dumps({'admitted': False, 'error': 'capacity_unavailable',
+                          'detail': str(exc), 'action': 'self_execute'}, ensure_ascii=False))
+        return 2
 
 
 def cmd_register(args):

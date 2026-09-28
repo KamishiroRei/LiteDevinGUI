@@ -213,6 +213,19 @@ class SubagentReservationTests(unittest.TestCase):
                 swe_subagents.cmd_done(argparse.Namespace(agent=token))
             self.assertFalse(swe_subagents.entry_path(token).exists())
 
+    def test_reserve_unknown_capacity_falls_back_to_self(self):
+        args = argparse.Namespace(parent="parent-session", title="task", host_pid=None)
+        with patch.dict(os.environ, {"LOCALAPPDATA": self.tmp.name}):
+            with patch.object(swe_subagents, "snapshot", side_effect=RuntimeError("unreadable")):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    result = swe_subagents.cmd_reserve(args)
+            self.assertEqual(result, 2)
+            reported = json.loads(output.getvalue())
+            self.assertEqual((reported["error"], reported["action"]),
+                             ("capacity_unavailable", "self_execute"))
+            self.assertFalse(list(swe_capacity.subagent_dir().glob("*.json")))
+
 
 if __name__ == "__main__":
     unittest.main()
