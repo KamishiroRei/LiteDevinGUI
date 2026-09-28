@@ -47,8 +47,8 @@ const DEVIN_EXE = process.env.DEVIN_EXE ?? 'devin'
 const CAPACITY_SCRIPT = process.env.DEVIN_LITE_CAPACITY_SCRIPT
   ?? 'C:\\Users\\ASUS\\.codex\\skills\\devin-session-collaboration\\scripts\\swe_capacity.py'
 const CAPACITY_PYTHON = process.env.DEVIN_LITE_PYTHON ?? 'python'
-/** 7..10 hard bound, matching the shared admission rule. */
-const CAPACITY_FALLBACK_LIMIT = Math.min(10, Math.max(7, Number(process.env.DEVIN_SWE_MAX_CONCURRENCY ?? 7) || 7))
+/** Fixed ten-slot bound, matching the shared admission rule. */
+const CAPACITY_FALLBACK_LIMIT = 10
 /** How often the deferred queue rechecks capacity. */
 const RETRY_POLL_MS = Math.min(600_000, Math.max(15_000, Number(process.env.DEVIN_LITE_RETRY_POLL_MS ?? 60_000)))
 /** After this long with no readable capacity, try one deferred prompt anyway —
@@ -647,7 +647,8 @@ function capacitySnapshot() {
       try {
         const parsed = JSON.parse(out)
         if (typeof parsed.active !== 'number' || typeof parsed.limit !== 'number') throw new Error('bad shape')
-        resolvePromise({ active: parsed.active, limit: parsed.limit, at: Date.now() })
+        resolvePromise({ active: parsed.active, limit: parsed.limit,
+          available: Math.max(0, parsed.limit - parsed.active), at: Date.now() })
       } catch { resolvePromise(null) }
     })
   }).finally(() => { capacityInflight = undefined })

@@ -239,6 +239,26 @@ async function refreshQueue() {
   } catch (err) { toast(`读取排队状态失败：${err.message}`, 'error') }
 }
 
+let capacitySeq = 0
+async function refreshCapacity() {
+  const seq = ++capacitySeq
+  const badge = $('capacityBadge')
+  try {
+    const cap = await api('GET', '/api/capacity')
+    if (seq !== capacitySeq) return
+    if (!Number.isFinite(cap.active) || !Number.isFinite(cap.limit)) throw new Error(cap.error ?? '容量状态不可读')
+    const available = Math.max(0, cap.limit - cap.active)
+    badge.textContent = `${cap.active}/${cap.limit}`
+    badge.classList.toggle('full', available === 0)
+    $('newBtn').title = `Devin 运行中 ${cap.active}/${cap.limit}，剩余 ${available}；满额时新消息会等待名额`
+  } catch (err) {
+    if (seq !== capacitySeq) return
+    badge.textContent = '?/10'
+    badge.classList.remove('full')
+    $('newBtn').title = `Devin 并发状态暂不可读：${err.message}`
+  }
+}
+
 /**
  * Close the currently open run when a different kind of update arrives.
  * Contiguous same-kind chunks share one element; a kind switch (or a new
@@ -1808,6 +1828,7 @@ function connectEvents() {
         const row = state.sessions.find(s => s.sessionId === ev.sessionId)
         if (row) row._busy = ev.busy
         renderSessions() // covers rows beyond the group limit / collapsed groups
+        void refreshCapacity()
         break
       }
       case 'attach-paths': for (const p of ev.paths ?? []) addPathRef(p); break
@@ -1922,7 +1943,8 @@ $('input').addEventListener('keyup', e => { if (e.key.startsWith('Arrow') || e.k
 document.addEventListener('pointerdown', e => {
   if (!e.target.closest('#composer')) { hideMentionMenu(); hideImagePreview() }
 })
-$('newBtn').addEventListener('click', () => newSession())
+$('newBtn').addEventListener('click', () => { void refreshCapacity(); void newSession() })
+$('newBtn').addEventListener('pointerenter', () => { void refreshCapacity() })
 $('reloadBtn').addEventListener('click', () => { void Promise.all([refreshSessions(), refreshArchives()]) })
 $('moreBtn').addEventListener('click', () => refreshSessions(true))
 $('activeSessionsTab').addEventListener('click', () => setSessionView('active'))
@@ -1954,7 +1976,7 @@ $('transcript').addEventListener('scroll', () => {
     const status = await api('GET', '/api/status')
     $('agentInfo').textContent = `${status.agentInfo.name ?? 'devin'} ${status.agentInfo.version ?? ''}`
     $('connectionDot').className = 'connection-dot online'
-    await Promise.all([refreshSessions(), refreshQueue()])
+    await Promise.all([refreshSessions(), refreshQueue(), refreshCapacity()])
     void refreshArchives()
     try {
       const saved = JSON.parse(localStorage.getItem('devin-lite:active') ?? 'null')

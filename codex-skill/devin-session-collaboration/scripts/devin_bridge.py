@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent, task-scoped collaboration for the native Devin CLI.
+"""Persistent, task-scoped collaboration through the Devin Lite host.
 
 The bridge never owns Devin credentials.  One SQLite database represents one
 collaboration task; each Devin participant has an independent runner process.
@@ -25,107 +25,50 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from swe_capacity import admit as admit_swe, CapacityCancelled
+from swe_capacity import admit as admit_swe, CapacityCancelled, limit as swe_limit, snapshot as swe_snapshot
 
 
 MODEL = "swe-2-high"
 MODEL_FAMILY = "swe-2"
 SCHEMA = 1
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-CREATE_SUSPENDED = 0x00000004
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 HOST_PIPE_ENV = "CODEX_APP_TOOLS_PIPE_PATH"
 HOST_FRAME_LIMIT = 8 * 1024 * 1024
 LITE_DEFAULT_URL = "http://127.0.0.1:8317"
 
 
-class _IOCounters(ctypes.Structure):
-    _fields_ = [(name, ctypes.c_ulonglong) for name in (
-        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
-        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
-
-
-class _BasicLimit(ctypes.Structure):
-    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
-                ("PerJobUserTimeLimit", ctypes.c_longlong),
-                ("LimitFlags", ctypes.c_ulong),
-                ("MinimumWorkingSetSize", ctypes.c_size_t),
-                ("MaximumWorkingSetSize", ctypes.c_size_t),
-                ("ActiveProcessLimit", ctypes.c_ulong),
-                ("Affinity", ctypes.c_size_t),
-                ("PriorityClass", ctypes.c_ulong),
-                ("SchedulingClass", ctypes.c_ulong)]
-
-
-class _ExtendedLimit(ctypes.Structure):
-    _fields_ = [("BasicLimitInformation", _BasicLimit),
-                ("IoInfo", _IOCounters),
-                ("ProcessMemoryLimit", ctypes.c_size_t),
-                ("JobMemoryLimit", ctypes.c_size_t),
-                ("PeakProcessMemoryUsed", ctypes.c_size_t),
-                ("PeakJobMemoryUsed", ctypes.c_size_t)]
-
-
-class OwnedJob:
-    """Contain exactly one native CLI invocation and all inherited children."""
-
-    def __init__(self):
-        self.handle = None
-        if os.name != "nt":
-            return
-        k = ctypes.windll.kernel32
-        k.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
-        k.CreateJobObjectW.restype = ctypes.c_void_p
-        k.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int,
-                                               ctypes.c_void_p, ctypes.c_ulong]
-        k.SetInformationJobObject.restype = ctypes.c_int
-        self.handle = k.CreateJobObjectW(None, None)
-        if not self.handle:
-            raise BridgeError(f"CreateJobObject failed: {ctypes.get_last_error()}")
-        info = _ExtendedLimit()
-        # The CLI/ACP tree stays owned by this job. A bridge-created peer runner
-        # explicitly breaks away and then owns a separate job of its own.
-        info.BasicLimitInformation.LimitFlags = 0x2000 | 0x0800
-        if not k.SetInformationJobObject(self.handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
-            self.close()
-            raise BridgeError(f"SetInformationJobObject failed: {ctypes.get_last_error()}")
-
-    def assign_and_resume(self, proc: subprocess.Popen) -> None:
-        if os.name != "nt":
-            return
-        k = ctypes.windll.kernel32
-        k.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        k.AssignProcessToJobObject.restype = ctypes.c_int
-        if not k.AssignProcessToJobObject(self.handle, int(proc._handle)):
-            proc.kill()
-            proc.wait()
-            raise BridgeError(f"AssignProcessToJobObject failed: {ctypes.get_last_error()}")
-        n = ctypes.windll.ntdll
-        n.NtResumeProcess.argtypes = [ctypes.c_void_p]
-        n.NtResumeProcess.restype = ctypes.c_long
-        status = n.NtResumeProcess(int(proc._handle))
-        if status != 0:
-            self.terminate()
-            proc.wait()
-            raise BridgeError(f"NtResumeProcess failed: NTSTATUS {status:#x}")
-
-    def terminate(self) -> None:
-        if os.name == "nt" and self.handle:
-            k = ctypes.windll.kernel32
-            k.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-            k.TerminateJobObject.restype = ctypes.c_int
-            if not k.TerminateJobObject(self.handle, 1):
-                raise BridgeError(f"TerminateJobObject failed: {ctypes.get_last_error()}")
-
-    def close(self) -> None:
-        if os.name == "nt" and self.handle:
-            ctypes.windll.kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-            ctypes.windll.kernel32.CloseHandle(self.handle)
-            self.handle = None
-
-
 class BridgeError(Exception):
     pass
+
+
+class BridgeCapacityFull(BridgeError):
+    def __init__(self, capacity: dict, action: str):
+        super().__init__(f"Devin capacity full: {capacity['active']}/{capacity['limit']}")
+        self.capacity = capacity
+        self.action = action
+
+
+def capacity_view() -> dict:
+    try:
+        state = swe_snapshot()
+        cap = swe_limit()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise BridgeError(f"Cannot verify Devin capacity: {exc}") from exc
+    return {"active": state["active"], "limit": cap,
+            "available": max(0, cap - state["active"]),
+            "sessions": state.get("sessions", []),
+            "subagents": state.get("subagents", []),
+            "unknown_or_other": state.get("unknown_or_other", 0)}
+
+
+def show_capacity(args: argparse.Namespace) -> None:
+    out(capacity_view())
+
+
+def require_lite_transport() -> None:
+    if os.environ.get("DEVIN_BRIDGE_TRANSPORT", "lite").strip().lower() != "lite":
+        raise BridgeError("Only the Devin Lite host is supported for model turns; unset DEVIN_BRIDGE_TRANSPORT or set it to lite")
 
 
 class HostSubmissionUncertain(BridgeError):
@@ -566,6 +509,7 @@ def bridge_instructions(state: Path, a: sqlite3.Row, wake_enabled: bool) -> str:
     st = ps_quote(str(state))
     aid = ps_quote(a["id"])
     base = f"& {p} {script} --state {st}"
+    subagents = f"& {p} {ps_quote(str(Path(__file__).with_name('swe_subagents.py').resolve()))}"
     wake_instruction = (
         f"This task has an existing Codex chat event route. On your final completed report directly "
         f"to the external Codex participant, add --final once. On a true blocker, use "
@@ -580,11 +524,14 @@ def bridge_instructions(state: Path, a: sqlite3.Row, wake_enabled: bool) -> str:
 You are participant {a['id']} ({a['name']}); your organizer is {a['parent_id']}.
  Your session workspace is {a['cwd']}; task-specific file scope and write ownership come from the task below. The bridge state is {state}, not the session workspace.
 Use this exact PowerShell command prefix: {base}
+All collaboration model turns use the resident Devin Lite ACP through this bridge. Do not launch a separate devin --print or devin acp for a peer task.
+Check live Devin capacity before creating a worker: {base} capacity. The shared limit is 10. If full, perform the work in your own Devin session; do not hand capacity overflow to Codex.
 Discover peers: {base} participants
 Read and mark your mailbox: {base} inbox --participant {aid} --read
 Send a note: {base} send --from {aid} --to <participant-id> --body-file <UTF-8-file>
 Send a request needing a new model turn: add --action to send; it queues for the recipient's original session.
- Create an independent SWE-2 High worker: {base} start --from {aid} --name <name> --cwd <stable-project-or-checkout-root> --prompt-file <UTF-8-task-file>. Keep per-task folders in the task file and bridge state; use a task folder as cwd only when it is truly its own project/checkout or the user wants a separate workspace.
+Create an independent SWE-2 High worker: {base} start --from {aid} --name <name> --cwd <stable-project-or-checkout-root> --prompt-file <UTF-8-task-file>. This creation command reports current active/available capacity and refuses at 10/10. Keep per-task folders in the task file and bridge state; use a task folder as cwd only when it is truly its own project/checkout or the user wants a separate workspace.
+For an internal run_subagent child, first reserve a slot: {subagents} reserve --parent <your-session-id> --title <task-title>. Launch only when admitted=true; on exit code 2, perform the work yourself. Release the returned reservation_id after the child completes or fails: {subagents} done --agent <reservation_id>. For a long task, refresh with heartbeat --agent <reservation_id>.
 When you need a peer's reply in this model turn, send a normal note and wait for that peer: {base} wait --self {aid} --actor <peer-id> --timeout 600; then mark the returned message read with inbox --read. Wait only when the reply is needed, not while independent work remains.
 Report a finished result: {base} report --from {aid} --to <recipient-id> --summary-file <UTF-8-file> --artifact <path>
 {wake_instruction}
@@ -594,11 +541,24 @@ Work autonomously to the specified effect. You may delegate, contact peers, and 
 
 
 def make_actor(args: argparse.Namespace) -> None:
+    require_lite_transport()
     state = state_dir(args)
     cwd = Path(args.cwd).resolve(strict=True)
     if not cwd.is_dir():
         raise BridgeError(f"Working directory is not a directory: {cwd}")
     prompt_file = require_file(args.prompt_file)
+    con = connect(state)
+    try:
+        sender = actor(con, args.sender)
+        sender_kind = sender["kind"]
+    finally:
+        con.close()
+    capacity = capacity_view()
+    if capacity["available"] == 0:
+        raise BridgeCapacityFull(capacity, "choose_codex_subagent" if sender_kind == "external" else "self_execute")
+    host = lite_request("GET", "/api/status", timeout=10)
+    if not isinstance(host.get("agentInfo"), dict) or not host["agentInfo"].get("name"):
+        raise BridgeError("Devin Lite ACP is not ready; no new participant was created")
     con = connect(state)
     with transaction(con):
         actor(con, args.sender)
@@ -610,7 +570,8 @@ def make_actor(args: argparse.Namespace) -> None:
                        VALUES (?,?,?,?,?,?)""", (tid, aid, "initial", str(prompt_file), "queued", t))
     con.close()
     pid = spawn_runner(state, aid)
-    out({"actor_id": aid, "turn_id": tid, "runner_pid": pid, "status": "queued", "model": MODEL})
+    out({"actor_id": aid, "turn_id": tid, "runner_pid": pid, "status": "queued",
+         "model": MODEL, "capacity_before": capacity})
 
 
 def attach(args: argparse.Namespace) -> None:
@@ -645,6 +606,7 @@ def attach(args: argparse.Namespace) -> None:
 
 
 def spawn_runner(state: Path, actor_id: str) -> int | None:
+    require_lite_transport()
     con = connect(state)
     token = uid("runner")
     with transaction(con):
@@ -685,6 +647,8 @@ def spawn_runner(state: Path, actor_id: str) -> int | None:
 
 
 def send(args: argparse.Namespace) -> None:
+    if args.action:
+        require_lite_transport()
     body = read_file(args.body_file) if args.body_file else args.text
     if not body or not body.strip():
         raise BridgeError("Message body is empty")
@@ -720,6 +684,7 @@ def send(args: argparse.Namespace) -> None:
 
 
 def enqueue_resume(args: argparse.Namespace) -> None:
+    require_lite_transport()
     state = state_dir(args)
     path = require_file(args.prompt_file)
     con = connect(state)
@@ -969,11 +934,12 @@ def cancel(args: argparse.Namespace) -> None:
             state = "cancelled"
     con.close()
     out({"actor_id": args.actor, "cancellation": state,
-         "note": "The owned runner terminates its own CLI child; this command never kills by process name."})
+         "note": "The owned runner requests cancellation of its exact turn; this command never kills by process name."})
 
 
 def activate(args: argparse.Namespace) -> None:
     """Release a held or interrupted participant after the caller checks it is idle."""
+    require_lite_transport()
     state = state_dir(args)
     con = connect(state)
     with transaction(con):
@@ -1263,87 +1229,8 @@ def run_turn(state: Path, actor_id: str, token: str, turn_id: str) -> None:
     failure = None
     cancelled = False
     try:
-        transport = os.environ.get("DEVIN_BRIDGE_TRANSPORT", "lite").lower()
-        if transport == "lite":
-            code, sid, observed = run_lite_turn(state, actor_id, token, turn_id, a, turn)
-        elif transport == "cli":
-            cli = cli_command()
-            validate_model(cli, a["cwd"])
-            argv = cli + ["--model", MODEL, "--permission-mode", "dangerous",
-                    "--respect-workspace-trust", "false"]
-            if a["session_id"]:
-                argv += ["--resume", a["session_id"]]
-            elif turn["kind"] != "initial":
-                raise BridgeError("Missing exact session ID")
-            argv += ["--prompt-file", turn["prompt_path"], "--export", turn["export_path"], "--print"]
-            job = OwnedJob()
-            try:
-                with open(turn["stdout_path"], "wb") as out_file, open(turn["stderr_path"], "wb") as err_file:
-                    def capacity_cancelled():
-                        check = connect(state)
-                        try:
-                            owner = actor(check, actor_id)
-                            return bool(owner["cancel_requested"] or owner["runner_token"] != token)
-                        finally:
-                            check.close()
-
-                    def capacity_status(stage, info):
-                        details = dict(info, status=stage, checked_at=now())
-                        if stage == "waiting_capacity":
-                            details["next_check_at"] = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=300)).isoformat()
-                        (Path(turn["prompt_path"]).parent / "capacity.json").write_text(
-                            json.dumps(details, ensure_ascii=False, indent=2), encoding="utf-8")
-                        check = connect(state)
-                        try:
-                            with transaction(check):
-                                status = "waiting_capacity" if stage == "waiting_capacity" else "running"
-                                check.execute("UPDATE actors SET status=?,updated_at=? WHERE id=? AND runner_token=?",
-                                              (status, now(), actor_id, token))
-                                check.execute("UPDATE turns SET status=? WHERE id=?", (status, turn_id))
-                        finally:
-                            check.close()
-
-                    proc = admit_swe(
-                        lambda: subprocess.Popen(argv, cwd=a["cwd"], env=cli_env(), stdin=subprocess.DEVNULL,
-                                                 stdout=out_file, stderr=err_file,
-                                                 creationflags=CREATE_NO_WINDOW | (CREATE_SUSPENDED if os.name == "nt" else 0)),
-                        cancelled=capacity_cancelled, on_status=capacity_status)
-                    job.assign_and_resume(proc)
-                    con = connect(state)
-                    with transaction(con):
-                        con.execute("UPDATE turns SET cli_pid=? WHERE id=?", (proc.pid, turn_id))
-                    con.close()
-                    while True:
-                        code = proc.poll()
-                        if code is not None:
-                            break
-                        con = connect(state)
-                        c = actor(con, actor_id)["cancel_requested"]
-                        con.close()
-                        if c:
-                            cancelled = True
-                            if os.name == "nt":
-                                job.terminate()  # Exact invocation and its descendants, not global image names.
-                            else:
-                                proc.terminate()
-                            try:
-                                code = proc.wait(timeout=8)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                                code = proc.wait(timeout=8)
-                            break
-                        time.sleep(0.5)
-            finally:
-                job.close()  # Also stops inherited children if runner fails or wrapper exits first.
-            if Path(turn["export_path"]).is_file():
-                sid, observed = inspect_export(Path(turn["export_path"]), a["session_id"])
-            if not cancelled:
-                if code != 0:
-                    raise BridgeError(f"Devin exited {code}; inspect {turn['stderr_path']}")
-                if not sid:
-                    raise BridgeError(f"Devin exit 0 without a verified export: {turn['export_path']}")
-        else:
-            raise BridgeError("DEVIN_BRIDGE_TRANSPORT must be lite or cli")
+        require_lite_transport()
+        code, sid, observed = run_lite_turn(state, actor_id, token, turn_id, a, turn)
     except CapacityCancelled:
         cancelled = True
     except BaseException as e:
@@ -1355,8 +1242,7 @@ def run_turn(state: Path, actor_id: str, token: str, turn_id: str) -> None:
         a = actor(con, actor_id)
         if a["runner_token"] != token:
             raise BridgeError("Runner lost ownership while finalizing")
-        if transport == "lite":
-            sid = sid or a["session_id"]
+        sid = sid or a["session_id"]
         state_name = "cancelled" if cancelled else "failed" if failure else "succeeded"
         con.execute("""UPDATE turns SET status=?,ended_at=?,exit_code=?,error=?,session_id=?,observed_model=?
                        WHERE id=?""", (state_name, now(), code, failure, sid, observed, turn_id))
@@ -1398,6 +1284,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--root", default="codex")
     c.add_argument("--codex-thread", help="Existing Codex chat UUID for direct messages and completion/block events")
     c.set_defaults(func=init)
+    c = sub.add_parser("capacity", help="Show live Devin active, limit and available slots")
+    c.set_defaults(func=show_capacity)
     c = sub.add_parser("start", help="Asynchronously create and start a Devin participant")
     c.add_argument("--from", dest="sender", required=True)
     c.add_argument("--name", required=True)
@@ -1504,6 +1392,10 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         args.func(args)
+    except BridgeCapacityFull as e:
+        out({"admitted": False, "error": "capacity_full", "capacity": e.capacity,
+             "action": e.action})
+        return 2
     except (BridgeError, sqlite3.Error, OSError) as e:
         print(json.dumps({"error": str(e)}, ensure_ascii=False), file=sys.stderr)
         return 2

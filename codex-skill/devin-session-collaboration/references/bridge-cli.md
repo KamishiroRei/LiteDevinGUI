@@ -1,6 +1,6 @@
 # Devin 桥梁 CLI 与架构
 
-入口：`C:\Users\ASUS\.codex\skills\devin-session-collaboration\scripts\devin_bridge.py`。本机 Python 标准库即可；状态目录由每次协作任务自己指定，互不混用。CLI 参数 `--state` 放在子命令之前。所有命令输出 JSON，错误写 stderr 并返回非零。路径和长正文用独立 UTF-8 文件传递。默认 `DEVIN_BRIDGE_TRANSPORT=lite`，由正在运行的 Devin Lite（默认 `http://127.0.0.1:8317`）持有唯一常驻 `devin acp`；桥梁 runner 只发 HTTP 请求和保存协作状态。Lite 不可达时任务明确失败，绝不静默启动第二个 Devin。端口不同可设置 `DEVIN_BRIDGE_LITE_URL`，只接受本机 HTTP。
+入口：`C:\Users\ASUS\.codex\skills\devin-session-collaboration\scripts\devin_bridge.py`。本机 Python 标准库即可；状态目录由每次协作任务自己指定，互不混用。CLI 参数 `--state` 放在子命令之前。所有命令输出 JSON；一般错误写 stderr，容量满额以 stdout JSON 返回 `admitted=false` 和退出码 2。路径和长正文用独立 UTF-8 文件传递。只允许 `DEVIN_BRIDGE_TRANSPORT=lite`，由正在运行的 Devin Lite（默认 `http://127.0.0.1:8317`）持有唯一常驻 `devin acp`；桥梁 runner 只发 HTTP 请求和保存协作状态。Lite 不可达时任务明确失败，绝不静默启动第二个 Devin。端口不同可设置 `DEVIN_BRIDGE_LITE_URL`，只接受本机 HTTP。
 
 ```powershell
 $bridge = 'C:\Users\ASUS\.codex\skills\devin-session-collaboration\scripts\devin_bridge.py'
@@ -9,6 +9,7 @@ $taskRoot = 'D:\Game\DNF\DNF复刻\AI任务\本次任务'
 $state = Join-Path $taskRoot 'bridge-state'
 $prompt = Join-Path $taskRoot 'worker A\任务.txt'
 python $bridge --state $state init --name '协作任务' --root codex
+python $bridge --state $state capacity  # active / limit=10 / available
 python $bridge --state $state start --from codex --name '实现者' --cwd $projectRoot --prompt-file $prompt
 python $bridge --state $state participants
 python $bridge --state $state status --actor a_返回的ID
@@ -16,9 +17,9 @@ python $bridge --state $state status --actor a_返回的ID
 
 `$projectRoot` 是 Devin 会话所属项目的稳定工作区；`$taskRoot` 只存本次任务的桥梁状态、任务书、隔离文件和结果。将每个 `worker A` 或 `AI任务` 子目录传给 `--cwd` 会让它们在 Devin Lite 中成为独立工作区。真正独立的项目或 checkout 才使用其自身根目录。任务范围与写入归属仍在任务书中用绝对路径写明；`--cwd` 不提供文件隔离。新建与续跑的目录选择见 [会话工作区与任务目录](../SKILL.md#会话工作区与任务目录)。
 
-`start` 立即返回桥梁 actor ID 和 runner PID；runner 经 `/api/bridge/turn/start` 创建或加载会话，使用指定 `--cwd` 作为会话工作区，并把任务文件正文作为 prompt。真正的 session ID 在 Lite 接受回合后写入 `status` / `participants`；任务文件目录或 `--state` 目录不会冒充会话工作区。Lite 端核对并选择 `swe-2-high` 与 `bypass`，回合状态与所选模型证据写入本轮 `lite-turn.json` / `export.json`。ACP 配置只能证明已选择模型，**不能冒充 CLI 导出中末次生成步骤的模型证据**；`observed_model` 因此留空。会话的登录与权限策略由同一 Lite ACP 宿主承担，工作区信任效果仍需实际验证。
+`start` 自动查询实际占用，成功结果附 `capacity_before`（含 `active/limit/available`）和桥梁 actor ID、runner PID；10/10 时返回退出码 2、`admitted=false`、`action=choose_codex_subagent`（由 Codex 发起）或 `action=self_execute`（由 Devin 发起），且不会创建 actor/turn。预检与真正派发间若发生并发竞争，后台仍会按全局锁进入 `waiting_capacity`；Codex 若要改派须先取消该待执行任务。runner 经 `/api/bridge/turn/start` 创建或加载会话，使用指定 `--cwd` 作为会话工作区，并把任务文件正文作为 prompt。真正的 session ID 在 Lite 接受回合后写入 `status` / `participants`；任务文件目录或 `--state` 目录不会冒充会话工作区。Lite 端核对并选择 `swe-2-high` 与 `bypass`，回合状态与所选模型证据写入本轮 `lite-turn.json` / `export.json`。ACP 配置只能证明已选择模型，**不能冒充 CLI 导出中末次生成步骤的模型证据**；`observed_model` 因此留空。会话的登录与权限策略由同一 Lite ACP 宿主承担，工作区信任效果仍需实际验证。
 
-只有显式 `DEVIN_BRIDGE_TRANSPORT=cli` 才走旧式每轮 `devin --print`，会另起 Devin 进程。此路径仍使用原生 CLI 模型目录校验、`--model swe-2-high`、`--permission-mode dangerous`、`--respect-workspace-trust false` 与每轮导出核验；它不满足单 ACP 入口目标，作为手动诊断兼容路径保留。
+旧 `DEVIN_BRIDGE_TRANSPORT=cli` 模型执行路径已禁用；设成 `cli` 会把该轮标为失败并报告明确原因，不会启动 `devin --print`。独立 CLI 仅用于只读诊断和核对旧会话，不参与新协作回合。
 
 ## 消息路径：邮箱、下一轮与当前轮
 
@@ -110,7 +111,7 @@ python $bridge --state $state recover --actor a_执行者
 
 `attach` 不复制或删除原会话；`--occupied` 表示调用方知道它在桥梁外被占用。若省略该标志，调用方承担已确认空闲的前提；桥梁无法为别的程序施加同一数据库锁。Lite `session/load` 报占用或恢复失败时该轮失败并保留准确 ID、状态和未消费消息。`activate` 只在调用方确认目标可续做后恢复排队。当前 `attach` 的旧导出要求属于兼容限制，不能用 Lite 的“已选模型”记录伪造原生导出。
 
-默认 Lite 路径不拥有 ACP 进程，`cancel` 不能按进程名终止它，也不能在同一 session 可能有 GUI 插话时贸然发会话级 ACP cancel。取消桥梁监视时状态会明确提示检查该 host turn 是否仍在运行；须在 Lite 中确认实际结果后再恢复，绝不自动重放。显式 CLI 兼容路径仍由 runner 的 Windows Job 只控制自己启动的 CLI 及子进程。runner 异常消失时 `recover` 核对 PID/创建时间并标记结果不确定；先检查 Lite 会话、产物和本轮记录，再对已验证的原 session 续跑。正式会话默认保留。
+默认 Lite 路径不拥有 ACP 进程，`cancel` 不能按进程名终止它，也不能在同一 session 可能有 GUI 插话时贸然发会话级 ACP cancel。取消桥梁监视时状态会明确提示检查该 host turn 是否仍在运行；须在 Lite 中确认实际结果后再恢复，绝不自动重放。历史独立 CLI 任务由原 runner 按准确 actor 收尾；新版桥梁不会新建此类任务。runner 异常消失时 `recover` 核对 PID/创建时间并标记结果不确定；先检查 Lite 会话、产物和本轮记录，再对已验证的原 session 续跑。正式会话默认保留。
 
 ## 状态与架构索引
 
@@ -120,10 +121,10 @@ python $bridge --state $state recover --actor a_执行者
 |---|---|---|
 | 注册与发现 | `init/start/attach` → `actors` → `participants/status`；桥梁 actor ID 与原生 session ID 分开 | `init`, `make_actor`, `attach`, `participants`, `status` |
 | 邮箱与排队 | `send` → `messages`；action 同事务建 `turns`；主动收信与自动边界续轮分开 | `send`, `inbox`, `enqueue_resume`, `wait_event` |
-| 单宿主执行 | 每 actor 独立 runner → Lite HTTP → 同一 ACP 中的新会话/续轮 → 状态；同 actor 只有一个 token | `spawn_runner`, `runner_loop`, `run_lite_turn`, `lite_request`；显式旧式 CLI 为 `run_turn` 分支 |
+| 单宿主执行 | 每 actor 独立 runner → Lite HTTP → 同一 ACP 中的新会话/续轮 → 状态；同 actor 只有一个 token | `spawn_runner`, `runner_loop`, `run_lite_turn`, `lite_request` |
 | 全局容量准入 | 每轮发给 Lite 前 → 本机实际会话＋归档 busy 会话＋已登记subagent去重 → 跨任务锁 → Lite 保留 busy 后释放锁；满额300秒后重查 | `scripts/swe_capacity.py` 的 `snapshot`, `summarize`, `admission_lock`, `admit`；每轮`capacity.json`；subagent登记见 `swe_subagents.py` |
 | 报告验收 | `report` → 版本和通知；`review` → 接受或带反证原会话返工 | `report`, `reports`, `review` |
-| 故障与生命周期 | Lite 状态丢失和 runner 对账、人工恢复；旧式 CLI 仍有 Job 归属 | `cancel`, `recover`, `activate`, `proc_birth`, `OwnedJob` |
+| 故障与生命周期 | Lite 状态丢失和 runner 对账、人工恢复 | `cancel`, `recover`, `activate`, `proc_birth` |
 | 主控事件路由 | 显式 direct 消息/最终报告/真实阻塞 → 持久事件 → Codex 宿主 pipe 的 `send_message_to_thread` → 原聊天接收确认 | `send`, `new_wake`, `dispatch_wake`, `host_send`, `send_event_to_codex_host`, `wake_ack` |
 
 调度没有固定树形；模型启动执行[全局并发准入](../SKILL.md#swe-并发准入与满额等待)。`swe_capacity.py`在每次 Lite turn start 前跨任务加锁，按实际会话与已登记 subagent 去重计数；满额的 actor/turn 为 `waiting_capacity`，300 秒后重查，`turns/<ID>/capacity.json` 保存准入证据。任何注册参与者都可成为组织者，有名额且职责不重叠时并行。桥梁不强制 OS 写入隔离，仍须明确共享文件与构建归属。父会话等待新子任务也占模型名额，应自行处理或释放自身轮次，不能用无限等待制造死锁。同一状态库里 session 唯一且每 actor 只有一个 runner；跨库容量锁不等于同一 session 的排他锁，纳入外部会话仍须确认占用并用 `--occupied` 排队。

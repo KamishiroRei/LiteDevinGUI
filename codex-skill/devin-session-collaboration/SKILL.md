@@ -19,24 +19,24 @@ Codex 有 Devin 名额时把 SWE-2 High 当作异步自主 subagent 使用，通
 
 ## SWE 并发准入与满额等待
 
-用户规定SWE并发上限在 **7–10个会话**范围内；默认上限 **7**，可在任务环境中明确配置为8、9或10，绝不超过10。发布新任务、续跑原会话、action触发下一轮及执行者自行派生任务前，都先检查当前实际运行总量；不能只数自己的任务库，也不能把历史会话数当运行数。
+用户规定 Devin 并发上限固定为 **10 条**。发布新任务、续跑原会话、action 触发下一轮及执行者自行派生任务前，都先检查当前实际运行总量；不能只数自己的任务库，也不能把历史会话数当运行数。`devin_bridge.py --state <任务状态目录> capacity` 返回 `active/limit/available`；`start` 自动预检并在结果中附带容量快照，满额时退出码 2、`admitted=false`，不创建 actor/turn。
 
 按实际执行会话计数：同一单轮Devin CLI与其ACP子进程合并为一个；跨项目SWE也占名额。独立ACP可能同时承载多个会话，不能按一个进程只记一个名额。已识别的Devin Lite宿主按实际监听端口读取全部分页会话列表，以sessionId去重计入每个busy会话；模型未知的busy会话同样占位。未知独立ACP或宿主列表不可达、字段不完整、分页未结束时，保留诊断并停止派发，不能按零或一个放行。其它不能确认活跃度的单轮/交互CLI保守占位。此检查只能证明本机可观察的调用与宿主报告状态；账号另有远端执行时，将已知占用纳入判断。Web宿主自行派发不持有本桥梁的准入锁，快照不是对全账号并发的绝对保证。
 
-会话内经 `run_subagent` 派生的 subagent **同样各占一个名额**（前台阻塞式与后台异步一样计）。已实测确认：subagent 不产生独立 `devin` 进程、`sessions.db` 会话行或 `/api/sessions` 条目，外部无法枚举，因此实行**派生方自报**：任何会话调用 `run_subagent` 前先跑 `swe_capacity.py` 看总量，满额（含已登记 subagent）不得派生，改为自己执行或推迟；获准启动后立即 `python scripts/swe_subagents.py register --agent <agent_id> --parent <自己的session/actor>`（该命令在同一全局准入锁内重查并原子登记，满额退出码2，`--wait` 按300秒轮询等位）；收到完成通知后 `done --agent <id>`，subagent 长时运行期间择机 `heartbeat`。登记项带 `host_pid` 时宿主进程已死即不计；超过 `DEVIN_SWE_SUBAGENT_TTL`（默认6小时）未保活视为残留不计入但保留待 `sweep` 清理。不可观测不等于不占名额：禁止以不登记绕过上限。
+会话内经 `run_subagent` 派生的 subagent **同样各占一个名额**（前台阻塞式与后台异步一样计）。已实测确认：subagent 不产生独立 `devin` 进程、`sessions.db` 会话行或 `/api/sessions` 条目，外部无法枚举，因此实行**派生方自报**：调用 `run_subagent` **之前**先运行 `python scripts/swe_subagents.py reserve --parent <自己的session/actor> --title <任务>`，该命令在全局准入锁内检查并登记，返回 `active_after/limit/available_after` 与 `reservation_id`。仅 `admitted=true` 才能启动；满额退出码 2 时由 Devin 当前会话自己执行，不转给 Codex，不排队派生。启动失败或子代理完成后立即 `done --agent <reservation_id>`；长时运行期间用 `heartbeat --agent <reservation_id>` 保活。旧 `register` 仅供已运行子代理的存量登记，不可作为新建前的预留。登记项带 `host_pid` 时宿主进程已死即不计；超过 `DEVIN_SWE_SUBAGENT_TTL`（默认6小时）未保活视为残留不计入但保留待 `sweep` 清理。不可观测不等于不占名额：禁止以不登记绕过上限。
 
 达到上限或新增后将超限，桥梁持久保留已提交的待执行任务并进入`waiting_capacity`。后台执行器**每300秒（5分钟）重新查询运行总量**，有空位时在全局准入锁内重查并启动；没有空位继续等，不能超发或终止他人的任务。等待期间可响应取消，但取消检查不额外轮询容量。查运行数与启动须为同一跨任务互斥操作，避免多个发布者同时占同一空位。Codex 为新任务选择执行者时，在提交前按上限检查；已满则按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max，不创建等位的 Devin 执行者。发现已超限时停止新增，等待自然释放。
 
 这是已提交 Devin 任务的异步容量调度，只轮询名额，不高频检查模型进度；Codex 新委派在预检满额时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max。对仍在桥梁等位的任务，后台队列负责5分钟复查。父会话需新子任务而无名额时，自行处理或保存状态后释放自身执行轮，避免名额全被等待子任务的父会话占满。
 
-桥梁每轮启动前调用`scripts/swe_capacity.py`：默认7，`DEVIN_SWE_MAX_CONCURRENCY`仅接受7..10；本机用户LocalAppData下的全局锁跨任务库共享。默认 Lite 路径在锁内调用 `/api/bridge/turn/start`，响应前 Lite 已保留 busy 计数，后续准入扫描将该会话计入；扫描包含归档中仍运行的会话。每轮`capacity.json`记录数量、上限、检查时间及满额时的下次检查时间。只读预检可直接运行该脚本（输出含已登记 subagent 计数与明细），派发仍在锁内重查。不要绕过桥梁直接启动模型以规避名额，也不要靠不登记 subagent 规避名额。
+桥梁每轮启动前调用 `scripts/swe_capacity.py`，固定上限 10；本机用户 LocalAppData 下的全局锁跨任务库共享。Lite 路径在锁内调用 `/api/bridge/turn/start`，响应前 Lite 已保留 busy 计数，后续准入扫描将该会话计入；扫描包含归档中仍运行的会话。每轮 `capacity.json` 记录数量、上限、检查时间及满额时的下次检查时间。只读预检可用桥梁 `capacity` 命令或容量脚本；派发仍在锁内重查。不要绕过桥梁直接启动模型以规避名额，也不要靠不登记 subagent 规避名额。
 
 Devin Lite（`D:\devin-lite`）侧已内置同口径自动化：`POST /api/prompt` 先做本机容量预检，满额直接进延期队列；发送或回合执行中遇到并发/配额类拒绝时同样入队，错误携带秒/分钟/小时或结构化期限时按 `期限+5s` 定时重发，否则每60秒（`DEVIN_LITE_RETRY_POLL_MS`）轮询容量空位；容量读不出时长时间停滞会慢速探针兜底。队列持久化在 `deferred-prompts.json`，经 `GET /api/queue`、`POST /api/queue/drop`、`GET /api/capacity` 查看与干预。该队列不持有全局准入锁，属尽力而为；桥梁派发仍走锁内准入。
 
 ## 选择入口
 
-- 日常多会话协作使用本技能 `scripts/devin_bridge.py`；默认 `DEVIN_BRIDGE_TRANSPORT=lite`，连接本机 `http://127.0.0.1:8317`（可由 `DEVIN_BRIDGE_LITE_URL` 指定本机端口）。Lite 不可达时明确失败并保留任务状态，不悄悄另启一套 Devin。具体操作见 [桥梁 CLI](references/bridge-cli.md)，状态与投递语义见 [桥梁契约](references/bridge-contract.md)。派单会给 Devin 执行者提供同一入口、任务 ID、关联参与者和使用示例，内部通讯无需经 Codex 逐条中转。
-- 独立诊断原生接口可直接用下方 CLI。确需旧式每轮独立 CLI 时显式设置 `DEVIN_BRIDGE_TRANSPORT=cli`；它会建立另一 Devin 实例，须先确认不是本次统一入口的协作任务。需要会话管理、异步消息或多方结果时回到桥梁，避免维护第二套状态。
+- 日常多会话协作使用本技能 `scripts/devin_bridge.py`；只允许 `DEVIN_BRIDGE_TRANSPORT=lite`，连接本机 `http://127.0.0.1:8317`（可由 `DEVIN_BRIDGE_LITE_URL` 指定本机端口）。Lite 不可达时明确失败并保留任务状态，不悄悄另启一套 Devin。具体操作见 [桥梁 CLI](references/bridge-cli.md)，状态与投递语义见 [桥梁契约](references/bridge-contract.md)。派单会给 Devin 执行者提供同一入口、任务 ID、关联参与者和使用示例，内部通讯无需经 Codex 逐条中转。
+- 原生 CLI 的 `--help`、模型目录与会话列表可用于只读诊断；协作模型回合一律通过桥梁和 Lite。旧 `DEVIN_BRIDGE_TRANSPORT=cli` 已禁用，若发现历史独立回合仍占锁，按准确 actor 取消或等待其结束，再由 Lite 装载原会话；不要按进程名全局清理。
 - 只有调用方需要 ACP 结构化协议时，使用 [ACP 驱动](../devin-acp-driver/SKILL.md)。ACP 不是直接 CLI 的前置依赖。
 
 ## 原生 CLI 的事实与命令
@@ -83,7 +83,7 @@ devin list --format json
 
 执行者报告改动、证据和未决项。执行完成、自检、独立接受和用户接受分别记录；按任务需要由指定接收者读实际产物并核对后接受，没有独立验收者时保留“自检完成”的真实状态。有反证则连同预期效果发回原会话，让执行者自主修到结束。内部咨询不设置审批门；需要多模态实战验收或动画/特效制作时路由 GPT-6。
 
-进程失败、取消、占用和重启保留可恢复的任务/消息状态。Lite 重启后旧 host turn ID 若消失，桥梁将该轮视作结果不确定，须先查看会话和产物再决定是否续跑，不能自动重复任务。默认路径的桥梁不能按进程名关闭共享 ACP；旧式 CLI 路径只关闭自己持有且身份能核对的进程。正式工作会话保留；纯探针会话保存必要导出后可由创建者执行 `devin rm <准确session-id> --force`，该命令不可恢复，不用于清理他人会话。
+进程失败、取消、占用和重启保留可恢复的任务/消息状态。Lite 重启后旧 host turn ID 若消失，桥梁将该轮视作结果不确定，须先查看会话和产物再决定是否续跑，不能自动重复任务。桥梁只请求取消自己记录的 host turn，不按进程名关闭共享 ACP。正式工作会话保留；纯探针会话保存必要导出后可由创建者执行 `devin rm <准确session-id> --force`，该命令不可恢复，不用于清理他人会话。
 
 与实际任务无关的会话历史/文件归因调查不属于本技能的默认动作。需要明确历史取证时按用户授权另外处理。
 

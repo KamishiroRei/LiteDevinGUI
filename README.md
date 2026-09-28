@@ -25,7 +25,7 @@ node server.mjs 9000   :: 自定义端口
 浏览器 (public/*)  ──REST/SSE──>  server.mjs  ──ndjson JSON-RPC──>  devin acp（唯一实例）
 ```
 
-- **单 acp 进程服务全部会话**：`session/load` 可同时装载多个 sessionId，与其他 devin 客户端并行存在
+- **单 ACP 进程服务统一入口的全部会话**：网页、Codex 桥梁及通过桥梁创建的 Devin 同级会话共享 Lite 持有的 `devin acp`；`session/load` 可装载多个 sessionId
 - `session/load` 的回放 update **不直接喷给前端**——服务端按会话缓冲（上限 4000 条），前端按"轮"分页拉取
 - 不绑定网页生命周期：server 常驻持有 acp；关闭/重开浏览器只是断开/重连 SSE
 - 静态资源 `Cache-Control: no-store`，改前端刷新即生效
@@ -39,6 +39,7 @@ node server.mjs 9000   :: 自定义端口
 - 工作区分组使用 Devin 会话创建时的 `cwd`。Codex/桥梁新建同一项目的任务会话时应传项目或独立 checkout 根目录；任务书与隔离目录可放在任务子目录，通过绝对路径交给执行者
 - 🔍 搜索（显示名/原标题/路径/ID 过滤）、↻ 刷新、底部「加载更多」翻页（`session/list` cursor）；自动刷新保留已加载的旧页
 - 行内状态：本服务在途 prompt 显示绿色「运行中」；其他实例锁定且执行状态不可读时，默认显示「运行中 · 其他窗口」，提示说明这是占用推断；工作区标题也显示活动点
+- 「新会话」按钮旁显示当前 Devin 并发占用（如 `2/10`）；悬浮提示剩余名额，状态不可读时显示 `?/10`。创建空会话仍可进行，满额时发送的新消息按延期队列处理
 - 行尾「⋯」菜单：复制会话 ID、重命名（**本地显示名**，存 localStorage；devin acp 未实现服务端 rename）、归档/恢复、删除；侧栏「会话 / 已归档」标签可直接切换。归档元数据由本机服务持久化，独立于普通会话分页；旧版浏览器归档会在首次连接新服务时迁移
 
 **会话与历史**
@@ -69,17 +70,20 @@ node server.mjs 9000   :: 自定义端口
 
 **并发延期队列**
 
-共享并发预算与 Codex 协作桥梁同口径（默认 7，`DEVIN_SWE_MAX_CONCURRENCY` 7–10 封顶）。非运行中会话发送前先做本机容量预检（`swe_capacity.py`：busy 会话＋CLI 实例＋已登记 subagent）；同一运行中会话的插话直接交给 Devin，不额外等待容量空位。满额时新会话 prompt 进入延期队列，ACP 明确拒绝并发或配额时也会自动入队重发。错误携带分钟、秒数或结构化期限时按 `期限+5s` 定时重发，期限之前不派发；未给期限时按容量与停滞探针节奏检查。队列持久化在 `deferred-prompts.json`，重启自动恢复并保持延期消息的顺序；「停止」会丢弃该会话尚在排队的项目。该队列是尽力而为的本机门禁（不持有全局准入锁），agent 侧的并发拒绝仍是权威兜底。
+共享并发预算与 Codex 协作桥梁同口径，固定上限 10 条。非运行中会话发送前先做本机容量预检（`swe_capacity.py`：busy 会话＋CLI 实例＋已预留的 subagent）；同一运行中会话的插话直接交给 Devin，不额外等待容量空位。满额时新会话 prompt 进入延期队列，ACP 明确拒绝并发或配额时也会自动入队重发。错误携带分钟、秒数或结构化期限时按 `期限+5s` 定时重发，期限之前不派发；未给期限时按容量与停滞探针节奏检查。队列持久化在 `deferred-prompts.json`，重启自动恢复并保持延期消息的顺序；「停止」会丢弃该会话尚在排队的项目。该队列是尽力而为的本机门禁（不持有全局准入锁），agent 侧的并发拒绝仍是权威兜底。
 
 **Codex 协作统一入口**
 
 Codex 的 `devin-session-collaboration` 桥梁默认连接本机 Lite 的 `/api/bridge/turn/start|status`，经这个服务的单个常驻 `devin acp` 创建或续跑 SWE 会话；因此 GUI 和桥梁看见同一批会话与运行状态。桥梁的 `--cwd` 只决定会话工作目录，任务文件正文才是发给 Devin 的 prompt；使用项目或独立 checkout 根目录作 `--cwd`，避免任务区被误列为工作区。Lite 不可达时桥梁会明确失败，不自动另起 Devin。回合完成后桥梁保留自身邮箱、报告和验收记录。桥梁的取消请求按 host turn 定位；同会话另有 GUI 插话时，后端会拒绝可能波及插话的会话级取消。
 
-桥梁本机地址默认 `http://127.0.0.1:8317`，可用 `DEVIN_BRIDGE_LITE_URL` 指向另一个本机端口。只有手动设 `DEVIN_BRIDGE_TRANSPORT=cli` 才使用旧式独立 CLI 轮次。模型证据为 ACP 已选配置或已接受设置请求，不能视作末次生成步骤的独立模型证明。
+桥梁 `capacity` 命令直接返回当前 `active/limit/available`；`start` 也自动附容量快照，10/10 时不创建新会话。Codex 可据此改选原生子代理；Devin 内部 `run_subagent` 必须先用 `swe_subagents.py reserve` 预留名额，满额时由当前 Devin 会话自己完成任务。预留在子代理结束或启动失败后用 `done` 释放。
+
+桥梁本机地址默认 `http://127.0.0.1:8317`；若单宿主部署在另一端口，用 `DEVIN_BRIDGE_LITE_URL` 指定同一个本机入口。桥梁已禁用 `DEVIN_BRIDGE_TRANSPORT=cli` 的独立模型轮次；Lite 不可达时明确失败。模型证据为 ACP 已选配置或已接受设置请求，不能视作末次生成步骤的独立模型证明。
 
 ## 已知限制
 
 - **锁定的会话无法接管**：`session/resume`/`session/fork`/force `_meta` 在当前 devin acp 均未实现（-32601）；在其他实例打开的会话需先在那里关闭
+- 独立 `devin --print` 或 Desktop 持有的 ACP 是父进程私有 stdio，Lite 无法接入其在途输入流；单进程保证适用于采用 Lite 统一入口的新回合。旧独立任务须结束或取消并释放会话锁后，才能由 Lite 装载原会话。
 - 其他进程内的真实执行状态 ACP 不暴露；「运行中 · 其他窗口」依据锁定状态推断，可能包含已打开但暂未生成的会话
 - 已用任务子目录作 `cwd` 创建的旧会话仍按原目录显示；改发会话规则不会改写它们的历史归属
 - 历史缓冲 4000 条/会话，更久远的部分不回溯（分页源是回放流，非磁盘日志）
@@ -115,7 +119,6 @@ Codex 的 `devin-session-collaboration` 桥梁默认连接本机 Lite 的 `/api/
 | `WINDSURF_API_KEY` | 认证回退（否则读 devin `credentials.toml`） |
 | `DEVIN_LITE_CAPACITY_SCRIPT` | 容量检查脚本（默认 `swe_capacity.py` 的协作技能路径） |
 | `DEVIN_LITE_PYTHON` | 跑容量脚本的解释器（默认 `python`） |
-| `DEVIN_SWE_MAX_CONCURRENCY` | 并发上限 7–10（默认 7；与协作桥梁共用同一口径） |
 | `DEVIN_LITE_RETRY_POLL_MS` | 队列轮询间隔（默认 60000，范围 15s–10min） |
 | `DEVIN_LITE_PROBE_AFTER_MS` | 容量读不出时的停滞探针等待（默认 300000） |
 | `DEVIN_LITE_CONCURRENCY_RE` | 并发拒绝的识别正则（覆盖默认模式时设） |

@@ -1,10 +1,8 @@
-"""Subagent self-registration for machine-wide Devin admission.
+"""Reserve a Devin slot before run_subagent; release it when the child ends.
 
-A run_subagent child creates no devin.exe process, no sessions.db row and no
-/api/sessions entry, so the launching session must report it here for the
-capacity snapshot to count it. `register` doubles as the admission gate: it
-rechecks the real total inside the same global lock used by the bridge and
-refuses (or with --wait polls every 300s) instead of over-admitting.
+A run_subagent child has no separate process or session row. The launching
+session must reserve its slot here before invoking the tool so simultaneous
+creators cannot exceed the shared limit.
 """
 from __future__ import annotations
 import argparse
@@ -13,11 +11,11 @@ import os
 from pathlib import Path
 import sys
 import time
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from swe_capacity import (admit, admission_lock, CapacityCancelled, limit,
-                          snapshot, subagent_dir, subagent_entries,
-                          POLL_SECONDS)
+from swe_capacity import (admission_lock, limit, snapshot, subagent_dir,
+                          subagent_entries)
 
 
 def entry_path(agent_id):
@@ -39,31 +37,36 @@ def write_entry(agent_id, parent, title, host_pid):
     return entry
 
 
-def cmd_register(args):
-    def start():
-        entry = write_entry(args.agent, args.parent, args.title, args.host_pid)
-        return {'admitted': True, 'entry': entry}
-    if args.wait:
-        def on_status(stage, info):
-            print(json.dumps({'status': stage, 'active': info['active'],
-                              'limit': info['limit']}, ensure_ascii=False),
-                  file=sys.stderr, flush=True)
-        try:
-            result = admit(start, on_status=on_status)
-        except CapacityCancelled:
-            print(json.dumps({'admitted': False, 'reason': 'cancelled'}))
-            return 3
-        print(json.dumps(result, ensure_ascii=False))
+def cmd_reserve(args):
+    with admission_lock():
+        state = snapshot()
+        cap = limit()
+        if state['active'] >= cap:
+            print(json.dumps({'admitted': False, 'active': state['active'],
+                              'limit': cap, 'available': 0,
+                              'action': 'self_execute'}, ensure_ascii=False))
+            return 2
+        token = 'r_' + uuid.uuid4().hex[:16]
+        entry = write_entry(token, args.parent, args.title, args.host_pid)
+        print(json.dumps({'admitted': True, 'reservation_id': token,
+                          'entry': entry, 'active_after': state['active'] + 1,
+                          'limit': cap, 'available_after': cap - state['active'] - 1},
+                         ensure_ascii=False))
         return 0
+
+
+def cmd_register(args):
     with admission_lock():
         state = snapshot()
         state['limit'] = limit()
         if state['active'] >= state['limit']:
             state['admitted'] = False
-            state['reason'] = 'capacity full; retry later or use --wait'
+            state['reason'] = 'capacity full; execute in the parent session'
+            state['action'] = 'self_execute'
             print(json.dumps(state, ensure_ascii=False))
             return 2
-        result = start()
+        entry = write_entry(args.agent, args.parent, args.title, args.host_pid)
+        result = {'admitted': True, 'entry': entry}
         result['active_after'] = state['active'] + 1
         result['limit'] = state['limit']
         print(json.dumps(result, ensure_ascii=False))
@@ -120,20 +123,23 @@ def cmd_sweep(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='cmd', required=True)
-    p = sub.add_parser('register', help='admit + register a live subagent')
+    p = sub.add_parser('reserve', help='reserve a slot before launching run_subagent')
+    p.add_argument('--parent', required=True, help='owning session id or actor name')
+    p.add_argument('--title', default=None)
+    p.add_argument('--host-pid', type=int, default=None)
+    p.set_defaults(func=cmd_reserve)
+    p = sub.add_parser('register', help='legacy reconciliation for an already running child; do not use for new launches')
     p.add_argument('--agent', required=True, help='agent_id returned by run_subagent')
     p.add_argument('--parent', default=None, help='owning session id or actor name')
     p.add_argument('--title', default=None)
     p.add_argument('--host-pid', type=int, default=None,
                    help='pid of the devin.exe hosting the parent; entry auto-drops when it dies')
-    p.add_argument('--wait', action='store_true',
-                   help='poll capacity every 300s instead of failing when full')
     p.set_defaults(func=cmd_register)
     p = sub.add_parser('heartbeat', help='refresh a registered subagent')
-    p.add_argument('--agent', required=True)
+    p.add_argument('--agent', required=True, help='reservation_id from reserve')
     p.set_defaults(func=cmd_heartbeat)
     p = sub.add_parser('done', help='deregister a finished subagent')
-    p.add_argument('--agent', required=True)
+    p.add_argument('--agent', required=True, help='reservation_id from reserve')
     p.set_defaults(func=cmd_done)
     p = sub.add_parser('list', help='show counted and ignored registrations')
     p.set_defaults(func=cmd_list)

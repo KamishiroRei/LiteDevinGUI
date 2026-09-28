@@ -1,4 +1,4 @@
-"""Machine-wide Devin admission: default 7, hard ceiling 10, retry every 300s."""
+"""Machine-wide Devin admission: ten concurrent turns, retry every 300s."""
 from __future__ import annotations
 import contextlib
 import ctypes
@@ -11,6 +11,7 @@ import urllib.request
 import urllib.parse
 
 POLL_SECONDS = 300
+MAX_CONCURRENCY = 10
 # A registered subagent that stops heartbeating is treated as leaked residue:
 # it stops counting after this TTL but stays on disk for `swe_subagents.py sweep`.
 SUBAGENT_TTL_SECONDS = int(os.environ.get('DEVIN_SWE_SUBAGENT_TTL', '21600'))  # 6h
@@ -19,10 +20,7 @@ class CapacityCancelled(Exception):
     pass
 
 def limit():
-    value = int(os.environ.get('DEVIN_SWE_MAX_CONCURRENCY', '7'))
-    if not 7 <= value <= 10:
-        raise ValueError('DEVIN_SWE_MAX_CONCURRENCY must be in 7..10')
-    return value
+    return MAX_CONCURRENCY
 
 def subagent_dir():
     return Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'CodexDevinBridge' / 'subagents'
@@ -230,8 +228,8 @@ def admission_lock(cancelled=lambda: False):
 def admit(start, cancelled=lambda: False, on_status=lambda *_: None,
           scan=snapshot, clock=time.monotonic, sleep=time.sleep, ceiling=None):
     cap = limit() if ceiling is None else ceiling
-    if not 7 <= cap <= 10:
-        raise ValueError('Capacity must be in 7..10')
+    if not 1 <= cap <= MAX_CONCURRENCY:
+        raise ValueError('Capacity must be in 1..10')
     while True:
         if cancelled():
             raise CapacityCancelled('Cancelled while waiting for capacity')
@@ -253,5 +251,6 @@ def admit(start, cancelled=lambda: False, on_status=lambda *_: None,
 
 if __name__ == '__main__':
     state = snapshot()
-    state.update(limit=limit(), poll_seconds=POLL_SECONDS)
+    cap = limit()
+    state.update(limit=cap, available=max(0, cap - state['active']), poll_seconds=POLL_SECONDS)
     print(json.dumps(state, ensure_ascii=False))
