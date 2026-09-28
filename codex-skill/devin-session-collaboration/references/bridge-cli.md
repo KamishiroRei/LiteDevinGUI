@@ -29,11 +29,12 @@ python $bridge --state $state status --actor a_返回的ID
 |---|---|---|---|
 | 另一个本地 SWE | `send` | 消息立即写入 SQLite 邮箱，不建立后续 turn；目标本轮若正在 `wait` 该发送者，作为当前工具结果返回，之后 `inbox --read` | 协作式当前轮可见；不自动打断忙碌模型 |
 | 另一个本地 SWE | `send --action` | 邮箱消息与 `turns` 中的后续任务同事务保存；当前回合结束后由 Lite 的原 session 执行 | 否 |
+| 已有 Devin 会话（外部主控发送） | `send --action` | 消息与 turn 持久保存；独立跟踪进程经同一 Lite/ACP 直接发 prompt，结果写回该 turn | 请求直接投递；模型实际应用仍看回合结果 |
 | 原 Codex 聊天 | 普通 `send` 或不带 `--final` 的 `report` | Codex 参与者的持久邮箱/报告，供主控自行读取 | 否 |
 | 原 Codex 聊天 | `send --direct` | 明确有行动价值的消息先保存到邮箱与事件，再调宿主发信 | 与 Codex 会话间工具同源；真实接收尚未实测 |
 | 原 Codex 聊天 | `report --final` 或 `block` | 持久事件后通过 Codex app-tools pipe 调宿主 `send_message_to_thread` | 使用与 Codex 会话间发信相同的宿主入口；真实接收尚未实测 |
 
-默认桥梁的 `run_turn` 经 Lite HTTP 进入同一个 ACP 宿主：新会话 `session/new`，续轮 `session/load`，随后 `session/prompt`。桥梁普通 `send` 则只写任务邮箱，没有自动把消息塞入正在生成的模型；接收方主动 `wait` / `inbox` 才能在该轮看到它。Lite GUI 的“插话”直接提交另一条 prompt，可观察接受与回合状态；这仍不等于经验证的模型级 `session/inject`。上游 [ACP 注入提案](https://github.com/agentclientprotocol/agent-client-protocol/pull/2043)不能当作当前 Devin 实现。单独启动 CLI 去抢同一 session 仍不可取。
+默认桥梁的 `run_turn` 经 Lite HTTP 进入同一个 ACP 宿主：新会话 `session/new`，续轮 `session/load`，随后 `session/prompt`。桥梁普通 `send` 则只写任务邮箱，没有自动把消息塞入正在生成的模型；接收方主动 `wait` / `inbox` 才能在该轮看到它。外部主控对已有 Devin 会话的 `send --action` 和 Lite GUI 的“插话”会直接提交另一条 prompt，可观察接受与回合状态；这仍不等于经验证的模型级 `session/inject`。上游 [ACP 注入提案](https://github.com/agentclientprotocol/agent-client-protocol/pull/2043)不能当作当前 Devin 实现。单独启动 CLI 去抢同一 session 仍不可取。
 
 `send --direct` 仅适用于任务绑定的原 Codex 聊天，对 SWE 接收者会明确报错。SWE 同级普通 `send` 是立即写入和可在**接收方当前轮**读取的路径；不能把保存消息等同于模型已经应用。若未来 ACP 明确支持模型级注入，再按消息 ID 区分接受、送达与应用。
 

@@ -39,7 +39,7 @@ node server.mjs 9000   :: 自定义端口
 - 工作区分组使用 Devin 会话创建时的 `cwd`。Codex/桥梁新建同一项目的任务会话时应传项目或独立 checkout 根目录；任务书与隔离目录可放在任务子目录，通过绝对路径交给执行者
 - 🔍 搜索（显示名/原标题/路径/ID 过滤）、↻ 刷新、底部「加载更多」翻页（`session/list` cursor）；自动刷新保留已加载的旧页
 - 行内状态：本服务在途 prompt 显示绿色「运行中」；其他实例锁定且执行状态不可读时，默认显示「运行中 · 其他窗口」，提示说明这是占用推断；工作区标题也显示活动点
-- 「新会话」按钮旁显示当前 Devin 并发占用（如 `2/10`）；悬浮提示剩余名额，状态不可读时显示 `?/10`。创建空会话仍可进行，满额时发送的新消息按延期队列处理
+- 「新会话」按钮旁显示当前 Devin 并发占用（如 `2/10`）；悬浮提示剩余名额，状态不可读时显示 `?/10`。创建空会话仍可进行；网页主动发送会立即尝试投递，后端拒绝时在该消息上显示失败
 - 行尾「⋯」菜单：复制会话 ID、重命名（**本地显示名**，存 localStorage；devin acp 未实现服务端 rename）、归档/恢复、删除；侧栏「会话 / 已归档」标签可直接切换。归档元数据由本机服务持久化，独立于普通会话分页；旧版浏览器归档会在首次连接新服务时迁移
 
 **会话与历史**
@@ -65,16 +65,18 @@ node server.mjs 9000   :: 自定义端口
 
 **排队反馈**
 
-- 当前会话的延期消息显示在输入区上方，包含到期倒计时与取消操作；到期进入发送后切换为「正在发送」，侧栏显示该会话的排队条数
+- 输入区上方默认展开所有会话的待处理消息，逐条显示来源、所属会话、内容摘要、等待原因、重试倒计时与尝试次数；长消息可按需查看全文，可打开会话、手动重试或取消尚未发送的项目。发送中的项目显示状态，侧栏也显示该会话的排队条数
 - 排队事件以独立提示显示，不会写进其他会话的对话历史；页面重开后从服务端重新读取排队状态
 
 **并发延期队列**
 
-共享并发预算与 Codex 协作桥梁同口径，固定上限 10 条。非运行中会话发送前先做本机容量预检（`swe_capacity.py`：busy 会话＋CLI 实例＋已预留的 subagent）；同一运行中会话的插话直接交给 Devin，不额外等待容量空位。满额时新会话 prompt 进入延期队列，ACP 明确拒绝并发或配额时也会自动入队重发。错误携带分钟、秒数或结构化期限时按 `期限+5s` 定时重发；所有被拒绝的消息至少等待 30 秒，未给期限时按 30 秒下限和容量检查节奏重试，期限之前绝不派发。队列持久化在 `deferred-prompts.json`，重启自动恢复并保持延期消息的顺序；恢复发送中的记录时也至少等待 30 秒，避免立刻重复提交。「停止」会丢弃该会话尚在排队的项目。该队列是尽力而为的本机门禁（不持有全局准入锁），agent 侧的并发拒绝仍是权威兜底。
+共享并发预算与 Codex 协作桥梁同口径，固定上限 10 条。新 Devin 执行者和 Devin 内部派生任务仍做容量准入。网页用户主动发送与外部主控发给已有会话的 action 直接进入同一 ACP，包括会话正在运行时的插话；若后端拒绝，明确反馈失败，不暗中排队重发。普通桥梁回合遭并发/配额拒绝时进入延期队列，同会话较早的延期项先发送。错误携带分钟、秒数或结构化期限时按 `期限+5s` 定时重发；所有被拒绝的队列项至少等待 30 秒，未给期限时按 30 秒下限和容量检查节奏重试，期限之前不自动派发。用户点「立即重试」可针对所选项目提前尝试，后端再次拒绝仍按新期限延期。队列持久化在 `deferred-prompts.json`，重启自动恢复并保持延期消息的顺序；恢复发送中的记录时也至少等待 30 秒，避免立刻重复提交。「停止」会丢弃该会话尚在排队的项目。该队列是尽力而为的本机门禁（不持有全局准入锁），agent 侧的并发拒绝仍是权威兜底。
 
 **Codex 协作统一入口**
 
 Codex 的 `devin-session-collaboration` 桥梁默认连接本机 Lite 的 `/api/bridge/turn/start|status`，经这个服务的单个常驻 `devin acp` 创建或续跑 SWE 会话；因此 GUI 和桥梁看见同一批会话与运行状态。桥梁的 `--cwd` 只决定会话工作目录，任务文件正文才是发给 Devin 的 prompt；使用项目或独立 checkout 根目录作 `--cwd`，避免任务区被误列为工作区。Lite 不可达时桥梁会明确失败，不自动另起 Devin。回合完成后桥梁保留自身邮箱、报告和验收记录。桥梁的取消请求按 host turn 定位；同会话另有 GUI 插话时，后端会拒绝可能波及插话的会话级取消。
+
+外部主控对已有 Devin 会话发 `send --action` 时，桥梁启动独立的直发跟踪进程，不等待该 actor 的普通 runner；消息与结果仍记录在同一个任务库。Devin 同级 action 与新会话继续遵守 10 条并发准入。ACP 接受并行 prompt 只证明请求已投递，具体何时被模型应用仍以真实回合结果为准。
 
 桥梁 `capacity` 命令直接返回当前 `active/limit/available`；`start` 也自动附容量快照，10/10 时不创建新会话。Codex 可据此改选原生子代理；Devin 内部 `run_subagent` 必须先用 `swe_subagents.py reserve` 预留名额，满额时由当前 Devin 会话自己完成任务。预留在子代理结束或启动失败后用 `done` 释放。
 
@@ -126,8 +128,8 @@ Codex 的 `devin-session-collaboration` 桥梁默认连接本机 Lite 的 `/api/
 
 ## 回归验证
 
-运行 `node tests/retry-recovery.mjs`。脚本把服务端复制到独立临时目录并使用假 ACP 与容量桩，不读取生产会话和延期队列；验证 1/2 分钟提示、无提示时 30 秒下限、到期后重发、启动恢复与忙时重启保护。
+运行 `node tests/retry-recovery.mjs`。脚本把服务端复制到独立临时目录并使用假 ACP 与容量桩，不读取生产会话和延期队列；验证队列逐项读取/操作、主控插话、1/2 分钟提示、无提示时 30 秒下限、到期后重发、启动恢复与忙时重启保护。
 
 ## REST 一览（给其他客户端复用同一 acp 实例）
 
-`GET /api/health|status` · `POST /api/agent/restart` · `GET /api/sessions` · `GET /api/archived` · `POST /api/sessions/new|load|archive|unarchive|delete|mode|config` · `GET /api/history` · `GET /api/session-images` · `GET /api/image-preview` · `POST /api/prompt` · `POST /api/cancel` · `POST /api/permission` · `POST /api/pick-folder` · `POST /api/pick-file` · `POST /api/clipboard-files` · `POST /api/attach` · `POST /api/bridge/turn/start|cancel` · `GET /api/bridge/turn/status` · `GET /api/queue` · `POST /api/queue/drop` · `GET /api/capacity` · `GET /api/events`（SSE：update/busy/permission/prompt-done/prompt-deferred/prompt-dispatch/bridge-turn/queue/session-archived/agent-ready/agent-down）
+`GET /api/health|status` · `POST /api/agent/restart` · `GET /api/sessions` · `GET /api/archived` · `POST /api/sessions/new|load|archive|unarchive|delete|mode|config` · `GET /api/history` · `GET /api/session-images` · `GET /api/image-preview` · `POST /api/prompt` · `POST /api/cancel` · `POST /api/permission` · `POST /api/pick-folder` · `POST /api/pick-file` · `POST /api/clipboard-files` · `POST /api/attach` · `POST /api/bridge/turn/start|cancel` · `GET /api/bridge/turn/status` · `GET /api/queue|queue/item` · `POST /api/queue/send|drop` · `GET /api/capacity` · `GET /api/events`（SSE：update/busy/permission/prompt-done/prompt-deferred/prompt-dispatch/bridge-turn/queue/session-archived/agent-ready/agent-down）

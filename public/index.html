@@ -65,11 +65,14 @@
       <div class="chat-subhead"><span class="chat-tab">对话</span><span id="optionBar"></span></div>
     </div>
     <div id="transcript"><div class="empty-state"><img src="favicon.svg" width="42" height="42" alt=""><h1>开始一个会话</h1><p>选择左侧会话，或在工作区中新建会话。</p></div></div>
-    <div id="queueBanner" class="queue-banner" hidden>
-      <span class="queue-mark" aria-hidden="true">◷</span>
-      <span id="queueText" class="queue-text"></span>
-      <button id="queueCancel" class="queue-cancel" type="button">取消排队</button>
-    </div>
+    <section id="queueBanner" class="queue-panel" aria-label="待处理消息" hidden>
+      <div class="queue-head">
+        <span class="queue-mark" aria-hidden="true">◷</span>
+        <strong id="queueText" class="queue-text"></strong>
+        <button id="queueToggle" class="queue-toggle" type="button" aria-expanded="true">收起</button>
+      </div>
+      <div id="queueList" class="queue-list"></div>
+    </section>
     <div id="composerArea">
       <div id="composer">
         <div id="imageMentionMenu" class="image-mention-menu" role="listbox" aria-label="当前会话图片" hidden></div>

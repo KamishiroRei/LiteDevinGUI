@@ -646,6 +646,34 @@ def spawn_runner(state: Path, actor_id: str) -> int | None:
     return proc.pid
 
 
+def spawn_controller_interjection(state: Path, actor_id: str, turn_id: str) -> int:
+    """Send an external controller action beside the actor's active runner."""
+    log_dir = state / "runners"
+    log_dir.mkdir(exist_ok=True)
+    stdout = open(log_dir / f"{turn_id}.out", "ab", buffering=0)
+    stderr = open(log_dir / f"{turn_id}.err", "ab", buffering=0)
+    try:
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--state", str(state),
+                                 "__inject", "--actor", actor_id, "--turn", turn_id],
+                                cwd=str(state), env=os.environ.copy(), stdin=subprocess.DEVNULL,
+                                stdout=stdout, stderr=stderr,
+                                creationflags=CREATE_NO_WINDOW |
+                                (CREATE_BREAKAWAY_FROM_JOB if os.name == "nt" else 0))
+    except BaseException as exc:
+        con = connect(state)
+        try:
+            with transaction(con):
+                con.execute("UPDATE turns SET status='failed',error=?,ended_at=? WHERE id=? AND status='dispatching'",
+                            (f"Could not dispatch controller interjection: {exc}", now(), turn_id))
+        finally:
+            con.close()
+        raise
+    finally:
+        stdout.close()
+        stderr.close()
+    return proc.pid
+
+
 def send(args: argparse.Namespace) -> None:
     if args.action:
         require_lite_transport()
@@ -655,7 +683,7 @@ def send(args: argparse.Namespace) -> None:
     state = state_dir(args)
     con = connect(state)
     with transaction(con):
-        actor(con, args.sender)
+        sender = actor(con, args.sender)
         dest = actor(con, args.recipient)
         if args.action and dest["kind"] != "devin":
             raise BridgeError("An external participant cannot receive a model action")
@@ -675,11 +703,18 @@ def send(args: argparse.Namespace) -> None:
             con.execute("""INSERT INTO turns(id,actor_id,kind,request_file,message_id,status,created_at)
                            VALUES (?,?,?,?,?,?,?)""", (tid, args.recipient, "message", "", mid, "queued", t))
             con.execute("UPDATE messages SET turn_id=? WHERE id=?", (tid, mid))
+        controller_direct = bool(args.action and sender["kind"] == "external" and dest["session_id"]
+                                 and dest["status"] not in ("held", "failed", "interrupted", "cancelled"))
+        if controller_direct:
+            # Reserve this turn before starting the watcher. The actor's
+            # normal runner selects only queued turns, so it cannot race us.
+            con.execute("UPDATE turns SET status='dispatching' WHERE id=?", (tid,))
         wid = new_wake(con, state, "message", args.sender, mid, body) if args.direct else None
     con.close()
-    pid = spawn_runner(state, args.recipient) if args.action else None
+    pid = (spawn_controller_interjection(state, args.recipient, tid) if controller_direct
+           else spawn_runner(state, args.recipient) if args.action else None)
     wake = dispatch_wake(state, wid) if wid else None
-    out({"message_id": mid, "state": "saved", "turn_id": tid,
+    out({"message_id": mid, "state": "direct_dispatch" if controller_direct else "saved", "turn_id": tid,
          "runner_pid": pid, "wake": wake})
 
 
@@ -1039,7 +1074,7 @@ def lite_request(method: str, path: str, payload: dict | None = None, timeout: f
     return data
 
 
-def run_lite_turn(state: Path, actor_id: str, token: str, turn_id: str,
+def run_lite_turn(state: Path, actor_id: str, token: str | None, turn_id: str,
                   a: sqlite3.Row, turn: sqlite3.Row) -> tuple[int, str, str | None]:
     """Run one bridge turn through Lite's single ACP owner, with no CLI peer."""
     prompt = Path(turn["prompt_path"]).read_text(encoding="utf-8")
@@ -1048,7 +1083,7 @@ def run_lite_turn(state: Path, actor_id: str, token: str, turn_id: str,
         check = connect(state)
         try:
             owner = actor(check, actor_id)
-            return bool(owner["cancel_requested"] or owner["runner_token"] != token)
+            return bool(owner["cancel_requested"] or (token is not None and owner["runner_token"] != token))
         finally:
             check.close()
 
@@ -1075,10 +1110,28 @@ def run_lite_turn(state: Path, actor_id: str, token: str, turn_id: str,
     elif turn["kind"] != "initial":
         raise BridgeError("Missing exact session ID")
 
-    # Admission and host registration occur under one cross-task lock. The
-    # server must reserve the turn before returning so the next scan sees it.
-    started = admit_swe(lambda: lite_request("POST", "/api/bridge/turn/start", payload),
-                        cancelled=capacity_cancelled, on_status=capacity_status)
+    # An external controller's action to an existing session is an
+    # interjection. It uses that session's existing host and must not wait
+    # behind unrelated new-session capacity admission. Devin-to-Devin actions
+    # and initial turns still pass through the shared ten-slot gate.
+    controller_message = False
+    if a["session_id"] and turn["kind"] == "message" and turn["message_id"]:
+        con = connect(state)
+        try:
+            sender = con.execute("""SELECT actors.kind FROM messages
+                                    JOIN actors ON actors.id=messages.sender_id
+                                    WHERE messages.id=?""", (turn["message_id"],)).fetchone()
+            controller_message = sender is not None and sender["kind"] == "external"
+        finally:
+            con.close()
+    if controller_message:
+        payload["priority"] = True
+        started = lite_request("POST", "/api/bridge/turn/start", payload)
+    else:
+        # Admission and host registration occur under one cross-task lock.
+        # The server reserves the turn before the next scan sees it.
+        started = admit_swe(lambda: lite_request("POST", "/api/bridge/turn/start", payload),
+                            cancelled=capacity_cancelled, on_status=capacity_status)
     sid, host_turn_id = started.get("sessionId"), started.get("turnId")
     if not isinstance(sid, str) or not sid or not isinstance(host_turn_id, str) or not host_turn_id:
         raise BridgeError(f"Devin Lite did not identify the started turn: {started}")
@@ -1275,6 +1328,77 @@ def run_turn(state: Path, actor_id: str, token: str, turn_id: str) -> None:
         raise SystemExit(0)
 
 
+def _controller_interjection(args: argparse.Namespace) -> None:
+    """Track one direct controller action without taking actor runner ownership."""
+    require_lite_transport()
+    state = state_dir(args)
+    con = connect(state)
+    try:
+        with transaction(con):
+            a = actor(con, args.actor)
+            turn = con.execute("SELECT * FROM turns WHERE id=? AND actor_id=?", (args.turn, args.actor)).fetchone()
+            if turn is None or turn["status"] != "dispatching" or not turn["message_id"] or not a["session_id"]:
+                raise BridgeError("Controller interjection is not reserved for an existing session")
+            m = message(con, turn["message_id"])
+            sender = actor(con, m["sender_id"])
+            if sender["kind"] != "external":
+                raise BridgeError("Only an external controller can use direct interjection")
+            turn_dir = state / "turns" / args.turn
+            turn_dir.mkdir(parents=True, exist_ok=True)
+            prompt = turn_dir / "prompt.txt"
+            prompt.write_text(bridge_instructions(state, a, bool(wake_thread(con))) +
+                              "\nTask for this turn:\n" +
+                              f"Incoming action message {m['id']} from {m['sender_id']}:\n{m['body']}",
+                              encoding="utf-8")
+            paths = (turn_dir / "export.json", turn_dir / "stdout.txt", turn_dir / "stderr.txt")
+            con.execute("""UPDATE turns SET status='running',started_at=?,prompt_path=?,
+                           export_path=?,stdout_path=?,stderr_path=? WHERE id=?""",
+                        (now(), str(prompt), *(str(path) for path in paths), args.turn))
+            con.execute("UPDATE messages SET offered_at=COALESCE(offered_at,?) WHERE id=?", (now(), m["id"]))
+            turn = con.execute("SELECT * FROM turns WHERE id=?", (args.turn,)).fetchone()
+    finally:
+        con.close()
+    code = None
+    sid = None
+    observed = None
+    failure = None
+    try:
+        code, sid, observed = run_lite_turn(state, args.actor, None, args.turn, a, turn)
+    except BaseException as exc:
+        failure = str(exc)
+    con = connect(state)
+    try:
+        with transaction(con):
+            con.execute("""UPDATE turns SET status=?,ended_at=?,exit_code=?,error=?,
+                           session_id=?,observed_model=? WHERE id=? AND status='running'""",
+                        ("failed" if failure else "succeeded", now(), code, failure,
+                         sid or a["session_id"], observed, args.turn))
+            if not failure:
+                con.execute("UPDATE messages SET consumed_at=COALESCE(consumed_at,?) WHERE id=?",
+                            (now(), turn["message_id"]))
+    finally:
+        con.close()
+    if failure:
+        raise BridgeError(failure)
+
+
+def controller_interjection(args: argparse.Namespace) -> None:
+    try:
+        _controller_interjection(args)
+    except BaseException as exc:
+        # A setup failure must not leave an invisible dispatching item. A
+        # failed host turn remains explicit for the controller to inspect.
+        con = connect(state_dir(args))
+        try:
+            with transaction(con):
+                con.execute("""UPDATE turns SET status='failed',ended_at=?,error=?
+                               WHERE id=? AND status IN ('dispatching','running')""",
+                            (now(), str(exc), args.turn))
+        finally:
+            con.close()
+        raise
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--state", required=True, help="Task-scoped persistent state directory")
@@ -1379,6 +1503,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--actor", required=True)
     c.add_argument("--token", required=True)
     c.set_defaults(func=runner)
+    c = sub.add_parser("__inject")
+    c.add_argument("--actor", required=True)
+    c.add_argument("--turn", required=True)
+    c.set_defaults(func=controller_interjection)
     c = sub.add_parser("__host_send")
     c.add_argument("--event", required=True)
     c.set_defaults(func=host_send)

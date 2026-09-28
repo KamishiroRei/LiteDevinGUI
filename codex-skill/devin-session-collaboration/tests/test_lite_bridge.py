@@ -81,6 +81,130 @@ class LiteTurnTests(unittest.TestCase):
         self.assertEqual(saved["model_evidence"], "set-request")
         self.assertNotIn("steps", saved)
 
+    def test_external_controller_action_bypasses_capacity_wait(self):
+        con = bridge.connect(self.state)
+        try:
+            t = bridge.now()
+            con.execute("UPDATE actors SET session_id=? WHERE id=?", ("existing-session", self.actor_id))
+            con.execute("""INSERT INTO messages(id,sender_id,recipient_id,kind,body,created_at)
+                           VALUES (?,?,?,?,?,?)""", ("m-controller", "codex", self.actor_id, "action", "interject", t))
+            con.execute("UPDATE turns SET kind='message',message_id=? WHERE id=?", ("m-controller", self.turn_id))
+            actor = bridge.actor(con, self.actor_id)
+            turn = con.execute("SELECT * FROM turns WHERE id=?", (self.turn_id,)).fetchone()
+        finally:
+            con.close()
+        calls = []
+
+        def fake_request(method, path, payload=None, timeout=35):
+            calls.append((method, path, payload))
+            if path == "/api/bridge/turn/start":
+                return {"sessionId": "existing-session", "turnId": "bt-controller",
+                        "observedModel": "swe-2-high", "modelEvidence": "set-request"}
+            return {"status": "done", "sessionId": "existing-session", "stopReason": "end_turn"}
+
+        with patch.object(bridge, "admit_swe", side_effect=AssertionError("capacity gate called")):
+            with patch.object(bridge, "lite_request", fake_request):
+                code, sid, _ = bridge.run_lite_turn(
+                    self.state, self.actor_id, self.token, self.turn_id, actor, turn)
+        self.assertEqual((code, sid), (0, "existing-session"))
+        self.assertTrue(calls[0][2]["priority"])
+        self.assertEqual(calls[0][2]["sessionId"], "existing-session")
+
+    def test_devin_peer_action_still_uses_capacity_gate(self):
+        con = bridge.connect(self.state)
+        try:
+            t = bridge.now()
+            con.execute("UPDATE actors SET session_id=? WHERE id=?", ("existing-session", self.actor_id))
+            con.execute("""INSERT INTO actors(id,name,kind,parent_id,cwd,model,status,created_at,updated_at)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        ("a-peer", "peer", "devin", "codex", self.tmp.name, bridge.MODEL, "idle", t, t))
+            con.execute("""INSERT INTO messages(id,sender_id,recipient_id,kind,body,created_at)
+                           VALUES (?,?,?,?,?,?)""", ("m-peer", "a-peer", self.actor_id, "action", "peer task", t))
+            con.execute("UPDATE turns SET kind='message',message_id=? WHERE id=?", ("m-peer", self.turn_id))
+            actor = bridge.actor(con, self.actor_id)
+            turn = con.execute("SELECT * FROM turns WHERE id=?", (self.turn_id,)).fetchone()
+        finally:
+            con.close()
+        admitted = []
+
+        def fake_admit(start, **kwargs):
+            admitted.append(True)
+            return start()
+
+        def fake_request(method, path, payload=None, timeout=35):
+            if path == "/api/bridge/turn/start":
+                self.assertNotIn("priority", payload)
+                return {"sessionId": "existing-session", "turnId": "bt-peer",
+                        "observedModel": "swe-2-high", "modelEvidence": "set-request"}
+            return {"status": "done", "sessionId": "existing-session", "stopReason": "end_turn"}
+
+        with patch.object(bridge, "admit_swe", fake_admit), patch.object(bridge, "lite_request", fake_request):
+            code, sid, _ = bridge.run_lite_turn(
+                self.state, self.actor_id, self.token, self.turn_id, actor, turn)
+        self.assertEqual((code, sid), (0, "existing-session"))
+        self.assertEqual(admitted, [True])
+
+    def test_controller_action_dispatches_now_without_taking_runner(self):
+        con = bridge.connect(self.state)
+        con.execute("UPDATE actors SET session_id=? WHERE id=?", ("existing-session", self.actor_id))
+        con.close()
+        args = argparse.Namespace(state=str(self.state), sender="codex", recipient=self.actor_id,
+                                  action=True, direct=False, text="主控补充信息", body_file=None)
+        output = io.StringIO()
+        with patch.object(bridge, "spawn_controller_interjection", return_value=5678) as dispatch:
+            with patch.object(bridge, "spawn_runner", side_effect=AssertionError("normal runner called")):
+                with contextlib.redirect_stdout(output):
+                    bridge.send(args)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["state"], "direct_dispatch")
+        dispatch.assert_called_once_with(self.state, self.actor_id, result["turn_id"])
+        con = bridge.connect(self.state)
+        try:
+            turn = con.execute("SELECT * FROM turns WHERE id=?", (result["turn_id"],)).fetchone()
+            self.assertEqual(turn["status"], "dispatching")
+            self.assertEqual(bridge.actor(con, self.actor_id)["runner_token"], self.token)
+        finally:
+            con.close()
+
+        with patch.object(bridge, "run_lite_turn", return_value=(0, "existing-session", None)) as direct:
+            bridge.controller_interjection(argparse.Namespace(state=str(self.state),
+                                                          actor=self.actor_id, turn=result["turn_id"]))
+        self.assertIsNone(direct.call_args.args[2])  # no actor-runner token ownership
+        con = bridge.connect(self.state)
+        try:
+            turn = con.execute("SELECT * FROM turns WHERE id=?", (result["turn_id"],)).fetchone()
+            message = con.execute("SELECT * FROM messages WHERE id=?", (result["message_id"],)).fetchone()
+            self.assertEqual(turn["status"], "succeeded")
+            self.assertIsNotNone(message["consumed_at"])
+            self.assertEqual(bridge.actor(con, self.actor_id)["runner_token"], self.token)
+            self.assertIn("主控补充信息", Path(turn["prompt_path"]).read_text(encoding="utf-8"))
+        finally:
+            con.close()
+
+    def test_controller_interjection_failure_is_visible_without_stopping_actor(self):
+        con = bridge.connect(self.state)
+        con.execute("UPDATE actors SET session_id=? WHERE id=?", ("existing-session", self.actor_id))
+        con.close()
+        args = argparse.Namespace(state=str(self.state), sender="codex", recipient=self.actor_id,
+                                  action=True, direct=False, text="补充", body_file=None)
+        output = io.StringIO()
+        with patch.object(bridge, "spawn_controller_interjection", return_value=5678):
+            with contextlib.redirect_stdout(output):
+                bridge.send(args)
+        result = json.loads(output.getvalue())
+        with patch.object(bridge, "run_lite_turn", side_effect=bridge.BridgeError("backend rejected")):
+            with self.assertRaisesRegex(bridge.BridgeError, "backend rejected"):
+                bridge.controller_interjection(argparse.Namespace(state=str(self.state),
+                                                              actor=self.actor_id, turn=result["turn_id"]))
+        con = bridge.connect(self.state)
+        try:
+            turn = con.execute("SELECT * FROM turns WHERE id=?", (result["turn_id"],)).fetchone()
+            self.assertEqual(turn["status"], "failed")
+            self.assertIn("backend rejected", turn["error"])
+            self.assertEqual(bridge.actor(con, self.actor_id)["runner_token"], self.token)
+        finally:
+            con.close()
+
     def test_cancel_addresses_only_its_host_turn(self):
         calls = []
 

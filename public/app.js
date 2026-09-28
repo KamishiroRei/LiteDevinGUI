@@ -25,6 +25,10 @@ const state = {
   busy: false,
   busySessions: new Set(), // sessionIds with an in-flight prompt (stop button follows the session, not the page)
   queueItems: [],       // persistent deferred prompts from /api/queue
+  queueExpanded: new Set(), // queueIds with full text open
+  queueFullText: new Map(), // fetched only for expanded queue items
+  queueActionPending: new Set(),
+  queueCollapsed: false,
   archiveRows: [],      // server-owned archived session metadata
   archiveReady: false,
   configOptions: [],     // select-type session config options (mode, model, …)
@@ -215,25 +219,123 @@ function showEmptyState() {
   $('transcript').innerHTML = '<div class="empty-state"><img src="favicon.svg" width="42" height="42" alt=""><h1>开始一个会话</h1><p>选择左侧会话，或在工作区中新建会话。</p></div>'
 }
 
-function updateQueueBanner() {
-  const banner = $('queueBanner')
-  const items = state.queueItems.filter(e => e.sessionId === state.active?.sessionId)
-  banner.hidden = items.length === 0
-  if (items.length === 0) return
-  const first = items[0]
-  const until = first.retryAt ? new Date(first.retryAt).getTime() - Date.now() : 0
-  const sending = first.state === 'sending'
-  const when = sending ? '正在发送' : until > 0 ? `约 ${Math.ceil(until / 1000)} 秒后重发` : '等待并发空位，自动重发'
-  $('queueText').textContent = `消息${sending ? '' : '已排队'}${items.length > 1 ? `（共 ${items.length} 条）` : ''} · ${when}${!sending && first.lastError ? ` · ${first.lastError}` : ''}`
-  $('queueText').title = first.preview ?? ''
-  $('queueCancel').hidden = sending
-  $('queueCancel').dataset.queueId = sending ? '' : first.queueId
+function queueStatus(entry) {
+  if (entry.state === 'sending') return '正在发送'
+  const until = entry.retryAt ? new Date(entry.retryAt).getTime() - Date.now() : 0
+  return until > 0 ? `约 ${Math.ceil(until / 1000)} 秒后重试` : '等待并发空位'
 }
 
+function updateQueueTimes() {
+  for (const el of $('queueList').querySelectorAll('[data-queue-status]')) {
+    const entry = state.queueItems.find(item => item.queueId === el.dataset.queueStatus)
+    if (entry) el.textContent = queueStatus(entry)
+  }
+}
+
+function queueButton(label, action, disabled = false) {
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.className = 'queue-action'
+  button.textContent = label
+  button.disabled = disabled
+  button.addEventListener('click', action)
+  return button
+}
+
+function updateQueueBanner() {
+  const panel = $('queueBanner')
+  const items = state.queueItems
+  panel.hidden = items.length === 0
+  if (!items.length) return
+  const current = items.filter(entry => entry.sessionId === state.active?.sessionId).length
+  $('queueText').textContent = `待处理消息 ${items.length} 条${current ? ` · 当前会话 ${current} 条` : ''}`
+  $('queueToggle').textContent = state.queueCollapsed ? '展开' : '收起'
+  $('queueToggle').setAttribute('aria-expanded', String(!state.queueCollapsed))
+  $('queueList').hidden = state.queueCollapsed
+  if (state.queueCollapsed) return
+  const list = $('queueList')
+  list.replaceChildren()
+  for (const entry of items) {
+    const row = document.createElement('article')
+    row.className = 'queue-item'
+    const top = document.createElement('div')
+    top.className = 'queue-item-top'
+    const identity = document.createElement('span')
+    identity.className = 'queue-identity'
+    const session = state.sessions.find(s => s.sessionId === entry.sessionId)
+      ?? state.archiveRows.find(s => s.sessionId === entry.sessionId)
+    identity.textContent = `${entry.source === 'bridge' ? '协作消息' : '网页消息'} · ${session ? sessionTitle(session.sessionId, session.title) : entry.sessionId}`
+    identity.title = entry.sessionId
+    top.append(identity)
+    const status = document.createElement('span')
+    status.className = 'queue-status'
+    status.dataset.queueStatus = entry.queueId
+    status.textContent = queueStatus(entry)
+    top.append(status)
+    row.append(top)
+    const content = document.createElement('div')
+    content.className = 'queue-content'
+    const full = state.queueFullText.get(entry.queueId)
+    const expanded = state.queueExpanded.has(entry.queueId)
+    content.textContent = expanded && full !== undefined ? full : entry.preview || (entry.imageCount ? `图片 ${entry.imageCount} 张` : '空消息')
+    if (!expanded && entry.textLength > (entry.preview?.length ?? 0)) content.textContent += '…'
+    row.append(content)
+    const meta = document.createElement('div')
+    meta.className = 'queue-meta'
+    const details = [entry.imageCount ? `图片 ${entry.imageCount} 张` : '',
+      `第 ${entry.attempts || 0} 次尝试`, entry.lastError ?? ''].filter(Boolean)
+    meta.textContent = details.join(' · ')
+    if (details.length) row.append(meta)
+    const actions = document.createElement('div')
+    actions.className = 'queue-actions'
+    if (entry.textLength > (entry.preview?.length ?? 0)) {
+      actions.append(queueButton(expanded ? '收起全文' : '查看全文', async () => {
+        if (expanded) state.queueExpanded.delete(entry.queueId)
+        else {
+          try {
+            if (!state.queueFullText.has(entry.queueId)) {
+              const data = await api('GET', `/api/queue/item?queueId=${encodeURIComponent(entry.queueId)}`)
+              state.queueFullText.set(entry.queueId, data.text ?? '')
+            }
+            state.queueExpanded.add(entry.queueId)
+          } catch (err) { toast(`读取消息失败：${err.message}`, 'error') }
+        }
+        updateQueueBanner()
+      }))
+    }
+    if (session?.cwd) actions.append(queueButton('打开会话', () => openSession(session)))
+    const pending = state.queueActionPending.has(entry.queueId)
+    if (entry.state === 'queued') {
+      actions.append(queueButton('立即重试', () => queueAction(entry.queueId, 'send'), pending))
+      actions.append(queueButton('取消排队', () => queueAction(entry.queueId, 'drop'), pending))
+    }
+    row.append(actions)
+    list.append(row)
+  }
+}
+
+async function queueAction(queueId, action) {
+  if (state.queueActionPending.has(queueId)) return
+  state.queueActionPending.add(queueId)
+  updateQueueBanner()
+  try {
+    const path = action === 'send' ? '/api/queue/send' : '/api/queue/drop'
+    const response = await api('POST', path, { queueId })
+    if (action === 'drop' && response.removed !== 1) throw new Error('该消息已开始发送或已离开队列')
+    toast(action === 'send' ? '已开始重试这条消息' : '已取消这条排队消息')
+  } catch (err) { toast(`${action === 'send' ? '重试' : '取消'}失败：${err.message}`, 'error') }
+  finally { state.queueActionPending.delete(queueId); await refreshQueue() }
+}
+
+let queueRefreshSeq = 0
 async function refreshQueue() {
+  const seq = ++queueRefreshSeq
   try {
     const data = await api('GET', '/api/queue')
+    if (seq !== queueRefreshSeq) return
     state.queueItems = Array.isArray(data.pending) ? data.pending : []
+    const ids = new Set(state.queueItems.map(e => e.queueId))
+    for (const id of state.queueFullText.keys()) if (!ids.has(id)) { state.queueFullText.delete(id); state.queueExpanded.delete(id) }
     updateQueueBanner()
     renderSessions()
   } catch (err) { toast(`读取排队状态失败：${err.message}`, 'error') }
@@ -1926,16 +2028,11 @@ function connectEvents() {
 // ---------------------------------------------------------------------------
 
 $('sendBtn').addEventListener('click', send)
-$('queueCancel').addEventListener('click', async () => {
-  const queueId = $('queueCancel').dataset.queueId
-  if (!queueId) return
-  try {
-    await api('POST', '/api/queue/drop', { queueId })
-    toast('已取消这条排队消息')
-    await refreshQueue()
-  } catch (err) { toast(`取消排队失败：${err.message}`, 'error') }
+$('queueToggle').addEventListener('click', () => {
+  state.queueCollapsed = !state.queueCollapsed
+  updateQueueBanner()
 })
-setInterval(() => { if (!state.queueItems.length) return; updateQueueBanner() }, 1000)
+setInterval(() => { if (state.queueItems.length) updateQueueTimes() }, 1000)
 const savedTheme = localStorage.getItem('devin-lite:theme')
 document.documentElement.dataset.theme = savedTheme === 'dark' ? 'dark' : 'light'
 $('themeBtn').addEventListener('click', () => {

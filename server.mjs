@@ -38,12 +38,11 @@ const PORT = Number(process.env.DEVIN_LITE_PORT ?? process.argv[2] ?? 8317)
 const DEVIN_EXE = process.env.DEVIN_EXE ?? 'devin'
 
 // ---------------------------------------------------------------------------
-// Capacity gate: prompts deferred while the shared Devin slot budget is full
+// Capacity gate for ordinary deferred bridge work
 // ---------------------------------------------------------------------------
 // The local gate runs swe_capacity.py (busy lite sessions + CLI invocations +
-// self-registered subagents, same accounting the bridge uses). It is
-// best-effort: when it fails we submit anyway and rely on the agent's own
-// concurrency rejection, which re-defers through the same queue.
+// self-registered subagents, same accounting the bridge uses). GUI sends and
+// external-controller interjections bypass this queue and report rejection.
 const CAPACITY_SCRIPT = process.env.DEVIN_LITE_CAPACITY_SCRIPT
   ?? 'C:\\Users\\ASUS\\.codex\\skills\\devin-session-collaboration\\scripts\\swe_capacity.py'
 const CAPACITY_PYTHON = process.env.DEVIN_LITE_PYTHON ?? 'python'
@@ -667,9 +666,9 @@ function requireDir(value) {
 // ---------------------------------------------------------------------------
 // Deferred-prompt queue: capacity-gated admission + timed retry
 // ---------------------------------------------------------------------------
-// A prompt enters the queue when the local capacity check reports the shared
-// slot budget full, or when the agent itself rejects session/prompt with a
-// concurrency/quota error. A timer rechecks every RETRY_POLL_MS and dispatches
+// An ordinary bridge prompt enters the queue when the agent rejects it with a
+// concurrency/quota error or an earlier same-session item is already queued.
+// A timer rechecks every RETRY_POLL_MS and dispatches
 // queued prompts as slots free up. A deferred session is NOT busy — it holds
 // no slot, so it must not count itself in the check.
 
@@ -709,11 +708,24 @@ function saveQueue() {
   try { writeFileSync(QUEUE_FILE, JSON.stringify(deferred)) } catch { /* advisory */ }
 }
 
+function queuePreview(entry) {
+  const raw = typeof entry.text === 'string' ? entry.text : ''
+  if (entry.source === 'bridge' || entry.turnId !== undefined) {
+    const marker = '\nTask for this turn:\n'
+    const at = raw.lastIndexOf(marker)
+    if (at >= 0) return raw.slice(at + marker.length, at + marker.length + 240)
+  }
+  return raw.slice(0, 240)
+}
+
 function queueView() {
   return deferred.map(e => ({
     queueId: e.queueId, sessionId: e.sessionId, attempts: e.attempts,
     state: e.state === 'sending' ? 'sending' : 'queued',
-    preview: typeof e.text === 'string' ? e.text.slice(0, 120) : '',
+    source: e.source ?? (e.turnId === undefined ? 'gui' : 'bridge'),
+    preview: queuePreview(e),
+    textLength: typeof e.text === 'string' ? e.text.length : 0,
+    imageCount: Array.isArray(e.images) ? e.images.length : 0,
     queuedAt: new Date(e.queuedAt).toISOString(), lastError: e.lastError,
     retryAt: e.retryAt === undefined ? undefined : new Date(e.retryAt).toISOString(),
   }))
@@ -886,9 +898,9 @@ async function dispatchPrompt(entry) {
     void pumpDeferred() // the freed slot may release this session's next queued prompt
   } catch (error) {
     settle()
-    // An agent that never started (spawn/ensure failure) is retryable like a
-    // concurrency rejection: re-queue rather than drop the user's message.
-    if (isConcurrencyError(error) || error?.agentDown === true) {
+    // Ordinary background work re-queues on concurrency or agent failure.
+    // An explicit controller interjection reports the error to its sender.
+    if (!entry.priority && (isConcurrencyError(error) || error?.agentDown === true)) {
       deferPrompt(entry, error.message ?? error, parseRetryAfterMs(error))
       void pumpDeferred()
       return
@@ -1290,28 +1302,12 @@ const routes = {
       throw httpError(400, 'sessionId and text or images required')
     }
     const dir = requireDir(cwd)
-    const entry = { sessionId, cwd: dir, text: text ?? '', images: imgs, committed: false, attempts: 0, queuedAt: Date.now(), lastError: null, state: 'queued', clientMessageId }
-    // Interjection: a session with a turn already in flight hands the new user
-    // message straight to the agent — it rides the slot the running turn
-    // already holds, so neither the deferred queue, the busy flag, nor the
-    // capacity check may park it. An authoritative rejection still lands in
-    // the deferred queue via dispatchPrompt (honest, not fake-interjected).
-    if (!acp.busy.has(sessionId)) {
-      // A session's prompts keep send order: anything queued (including one
-      // mid-retry) means this prompt waits in line behind it.
-      if (deferred.some(e => e.sessionId === sessionId)) {
-        deferPrompt(entry, 'queued behind earlier deferred prompt')
-        return { deferred: true, queueId: entry.queueId, position: deferred.indexOf(entry) + 1 }
-      }
-      // Local capacity gate — best effort. An unreadable check submits anyway;
-      // the agent's own concurrency rejection re-defers through the same queue.
-      const cap = await capacitySnapshot()
-      lastCapacity = cap === null ? { error: 'capacity check failed', at: Date.now() } : cap
-      if (cap !== null && cap.active >= cap.limit) {
-        deferPrompt(entry, `capacity full (${cap.active}/${cap.limit})`)
-        return { deferred: true, queueId: entry.queueId, position: deferred.length, capacity: cap }
-      }
-    }
+    // The browser's explicit send is a controller interjection. It bypasses
+    // older deferred work and the local capacity preflight; if Devin rejects
+    // it, report the failure to the sender instead of silently queueing it.
+    const entry = { sessionId, cwd: dir, text: text ?? '', images: imgs, committed: false,
+      attempts: 0, queuedAt: Date.now(), lastError: null, state: 'queued', clientMessageId,
+      source: 'gui', priority: true }
     // The prompt resolves when the turn ends — potentially minutes later.
     // Answer immediately and report the outcome over SSE instead.
     entry.attempts++
@@ -1328,7 +1324,7 @@ const routes = {
    * clientTurnId is an idempotency key: repeating it returns the same turn.
    */
   'POST /api/bridge/turn/start': async (req) => {
-    const { sessionId: requestedSid, cwd, text, images, model, modeId, clientTurnId, clientMessageId } = await readBody(req)
+    const { sessionId: requestedSid, cwd, text, images, model, modeId, clientTurnId, clientMessageId, priority } = await readBody(req)
     if (typeof clientTurnId === 'string' && clientTurnIds.has(clientTurnId)) {
       const turn = bridgeTurns.get(clientTurnIds.get(clientTurnId))
       if (turn !== undefined) return { ...turnView(turn), deduped: true }
@@ -1370,7 +1366,12 @@ const routes = {
     const entry = {
       sessionId, cwd: dir, text, images: imgs, committed: false, attempts: 0,
       queuedAt: Date.now(), lastError: null, state: 'queued',
-      turnId: turn.turnId, clientMessageId,
+      turnId: turn.turnId, clientMessageId, source: 'bridge',
+      priority: priority === true && typeof requestedSid === 'string' && requestedSid !== '',
+    }
+    if (!entry.priority && deferred.some(queued => queued.sessionId === sessionId)) {
+      deferPrompt(entry, '同一会话中有更早的待发送消息')
+      return { ...turnView(turn), observedModel, modelEvidence, mode, busy: acp.busy.get(sessionId) ?? 0 }
     }
     entry.attempts++
     turn.attempts = entry.attempts
@@ -1448,6 +1449,44 @@ const routes = {
     pollMs: RETRY_POLL_MS,
     limit: CAPACITY_FALLBACK_LIMIT,
   }),
+
+  /** Full text is fetched only when someone opens an item, so regular queue
+   * refreshes do not repeatedly transfer a long bridge task prompt. */
+  'GET /api/queue/item': async (_req, query) => {
+    const entry = deferred.find(e => e.queueId === query.get('queueId'))
+    if (entry === undefined) throw httpError(404, 'queued prompt not found')
+    return { queueId: entry.queueId, sessionId: entry.sessionId, text: entry.text,
+      imageCount: Array.isArray(entry.images) ? entry.images.length : 0 }
+  },
+
+  /** An explicit click can advance one queued item; later items in the same
+   * session keep their order. This bypasses the suggested retry time only for
+   * this one attempt, while backend rejection still re-defers normally. */
+  'POST /api/queue/send': async (req) => {
+    const { queueId } = await readBody(req)
+    if (typeof queueId !== 'string' || queueId === '') throw httpError(400, 'queueId required')
+    const index = deferred.findIndex(e => e.queueId === queueId)
+    if (index < 0) throw httpError(404, 'queued prompt not found')
+    const entry = deferred[index]
+    if (entry.state !== 'queued') throw httpError(409, '该消息正在发送中')
+    if (deferred.slice(0, index).some(e => e.sessionId === entry.sessionId)) {
+      throw httpError(409, '请先处理本会话更早的排队消息')
+    }
+    entry.state = 'sending'
+    entry.attempts = (Number(entry.attempts) || 0) + 1
+    entry.lastAttemptAt = Date.now()
+    saveQueue()
+    acp.emit({ kind: 'prompt-dispatch', sessionId: entry.sessionId, queueId,
+      attempt: entry.attempts,
+      ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}) })
+    if (entry.turnId !== undefined) {
+      const turn = bridgeTurns.get(entry.turnId)
+      if (turn !== undefined) turnSet(turn, 'running', { attempts: entry.attempts, retryAt: undefined, queueId: undefined, lastError: undefined })
+    }
+    log(`manually dispatching deferred prompt for ${entry.sessionId} (attempt ${entry.attempts})`)
+    void dispatchPrompt(entry)
+    return { started: true, queueId }
+  },
 
   'GET /api/capacity': async () => {
     const cap = await capacitySnapshot()

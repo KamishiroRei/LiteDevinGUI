@@ -129,7 +129,9 @@ async function drop(queueId) {
 async function rejectedPrompt(text, errorMessage) {
   writeFileSync(PROMPT_LOG, '')
   setState({ promptMode: 'reject', rejectMessage: errorMessage, rejectData: undefined })
-  const response = await api('POST', '/api/prompt', { sessionId: 's1', cwd: WORK, text })
+  const response = await api('POST', '/api/bridge/turn/start', {
+    sessionId: 's1', cwd: WORK, text, clientTurnId: `turn-${text}`,
+  })
   const first = await until(() => lines(PROMPT_LOG).find(row => row.text === text))
   const queued = await nextQueued()
   return { response, first, queued, deadline: new Date(queued.retryAt).getTime() }
@@ -160,7 +162,9 @@ async function run() {
   check('idle ACP restarts on request', restarted.status === 200 && lines(START_LOG).length === 2)
 
   setState({ promptMode: 'hang' })
-  const running = await api('POST', '/api/prompt', { sessionId: 's1', cwd: WORK, text: 'keep-busy' })
+  const running = await api('POST', '/api/bridge/turn/start', {
+    sessionId: 's1', cwd: WORK, text: 'keep-busy', clientTurnId: 'turn-keep-busy',
+  })
   await until(() => lines(PROMPT_LOG).some(row => row.text === 'keep-busy'))
   const busyRestart = await api('POST', '/api/agent/restart', {})
   check('active turn blocks restart', running.status === 200 && busyRestart.status === 409)
@@ -183,7 +187,44 @@ async function run() {
     `delay=${oneMinute.deadline - oneMinute.first.at}ms`)
   await sleep(1500)
   check('one minute error does not resend immediately', lines(PROMPT_LOG).length === 1)
-  await drop(oneMinute.queued.queueId)
+  const secondQueued = await api('POST', '/api/bridge/turn/start', {
+    sessionId: 's1', cwd: WORK, text: 'ordinary-behind', clientTurnId: 'turn-ordinary-behind',
+  })
+  const queueWithTwo = await api('GET', '/api/queue')
+  check('ordinary bridge message stays behind earlier deferred work',
+    secondQueued.body?.status === 'deferred' && queueWithTwo.body?.pending?.length === 2
+      && lines(PROMPT_LOG).length === 1)
+  const secondId = queueWithTwo.body.pending.find(e => e.preview === 'ordinary-behind')?.queueId
+  const fullItem = await api('GET', `/api/queue/item?queueId=${encodeURIComponent(oneMinute.queued.queueId)}`)
+  check('queue detail exposes full message for inspection',
+    fullItem.status === 200 && fullItem.body?.text === 'one-minute'
+      && queueWithTwo.body.pending[0].source === 'bridge')
+  const outOfOrder = await api('POST', '/api/queue/send', { queueId: secondId })
+  check('manual retry refuses to overtake earlier same-session item', outOfOrder.status === 409)
+
+  setState({ promptMode: 'reject', rejectMessage: 'Too many concurrent sessions; wait 2 minutes.' })
+  const directGui = await api('POST', '/api/prompt', { sessionId: 's1', cwd: WORK, text: 'controller-direct' })
+  await until(() => lines(PROMPT_LOG).find(row => row.text === 'controller-direct'))
+  const afterDirect = await api('GET', '/api/queue')
+  check('GUI interjection bypasses queue and backend rejection is not silently requeued',
+    directGui.status === 200 && afterDirect.body?.pending?.length === 2
+      && !afterDirect.body.pending.some(e => e.preview === 'controller-direct'))
+
+  setState({ promptMode: 'ok' })
+  const directBridge = await api('POST', '/api/bridge/turn/start', {
+    sessionId: 's1', cwd: WORK, text: 'bridge-controller-direct',
+    priority: true, clientTurnId: 'turn-bridge-controller-direct',
+  })
+  await until(() => lines(PROMPT_LOG).find(row => row.text === 'bridge-controller-direct'))
+  check('priority bridge interjection bypasses earlier queued messages',
+    directBridge.status === 200 && directBridge.body?.status === 'running')
+
+  const manualFirst = await api('POST', '/api/queue/send', { queueId: oneMinute.queued.queueId })
+  await until(() => lines(PROMPT_LOG).filter(row => row.text === 'one-minute').length === 2)
+  await until(async () => (await api('GET', '/api/queue')).body.pending.length === 1)
+  check('manual retry sends selected item and keeps later queue item',
+    manualFirst.status === 200 && manualFirst.body?.started === true)
+  await drop(secondId)
 
   const twoMinutes = await rejectedPrompt('two-minutes',
     'Too many concurrent sessions; please wait 2 minutes before retrying.')
@@ -215,6 +256,12 @@ async function run() {
     text: 'recovered-sending', images: [], committed: false, state: 'sending',
     attempts: 1, queuedAt: lastAttemptAt - 1000, lastAttemptAt,
     retryAt: lastAttemptAt - 1000, lastCheckAt: lastAttemptAt - 1000,
+  }, {
+    queueId: 'q-bridge-preview', sessionId: 's2', cwd: WORK, source: 'bridge',
+    text: 'Internal bridge instructions\nTask for this turn:\n实际排队任务：检查文件路径',
+    images: [], committed: false, state: 'queued', attempts: 1,
+    queuedAt: lastAttemptAt - 1000, lastAttemptAt,
+    retryAt: lastAttemptAt + 120_000,
   }]))
   setState({ promptMode: 'ok' })
   startServer()
@@ -224,9 +271,12 @@ async function run() {
   const recoveryAt = new Date(recovered?.retryAt).getTime()
   check('persisted sending entry recovers behind 30s floor', recovered?.state === 'queued' && recoveryAt >= lastAttemptAt + 30_000,
     `delay=${recoveryAt - lastAttemptAt}ms`)
+  check('bridge queue summary shows task body instead of boilerplate',
+    queueResponse.body.pending.find(entry => entry.queueId === 'q-bridge-preview')?.preview === '实际排队任务：检查文件路径')
   await sleep(1500)
   check('persisted sending entry does not replay at boot', lines(PROMPT_LOG).length === 0)
   await drop('q-recovered-sending')
+  await drop('q-bridge-preview')
 
   const failures = checks.filter(result => !result.pass)
   console.log(`${checks.length - failures.length}/${checks.length} checks passed`)

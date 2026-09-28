@@ -19,7 +19,7 @@ Codex 有 Devin 名额时把 SWE-2 High 当作异步自主 subagent 使用，通
 
 ## SWE 并发准入与满额等待
 
-用户规定 Devin 并发上限固定为 **10 条**。发布新任务、续跑原会话、action 触发下一轮及执行者自行派生任务前，都先检查当前实际运行总量；不能只数自己的任务库，也不能把历史会话数当运行数。`devin_bridge.py --state <任务状态目录> capacity` 返回 `active/limit/available`；`start` 自动预检并在结果中附带容量快照，满额时退出码 2、`admitted=false`，不创建 actor/turn。
+用户规定 Devin 并发上限固定为 **10 条**。发布新执行者、普通续跑或 Devin 同级 action 触发下一轮，以及执行者自行派生任务前，都先检查当前实际运行总量；不能只数自己的任务库，也不能把历史会话数当运行数。**外部主控发给已有 Devin 会话的 action 是同会话插话**，直接通过 Lite 投递并单独追踪结果，不占一个新执行者名额，也不等待普通队列。`devin_bridge.py --state <任务状态目录> capacity` 返回 `active/limit/available`；`start` 自动预检并在结果中附带容量快照，满额时退出码 2、`admitted=false`，不创建 actor/turn。
 
 按实际执行会话计数：同一单轮Devin CLI与其ACP子进程合并为一个；跨项目SWE也占名额。独立ACP可能同时承载多个会话，不能按一个进程只记一个名额。已识别的Devin Lite宿主按实际监听端口读取全部分页会话列表，以sessionId去重计入每个busy会话；模型未知的busy会话同样占位。未知独立ACP或宿主列表不可达、字段不完整、分页未结束时，保留诊断并停止派发，不能按零或一个放行。其它不能确认活跃度的单轮/交互CLI保守占位。此检查只能证明本机可观察的调用与宿主报告状态；账号另有远端执行时，将已知占用纳入判断。Web宿主自行派发不持有本桥梁的准入锁，快照不是对全账号并发的绝对保证。
 
@@ -29,9 +29,9 @@ Codex 有 Devin 名额时把 SWE-2 High 当作异步自主 subagent 使用，通
 
 这是已提交 Devin 任务的异步容量调度，只轮询名额，不高频检查模型进度；Codex 新委派在预检满额时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max。对仍在桥梁等位的任务，后台队列负责5分钟复查。父会话需新子任务而无名额时，自行处理或保存状态后释放自身执行轮，避免名额全被等待子任务的父会话占满。
 
-桥梁每轮启动前调用 `scripts/swe_capacity.py`，固定上限 10；本机用户 LocalAppData 下的全局锁跨任务库共享。Lite 路径在锁内调用 `/api/bridge/turn/start`，响应前 Lite 已保留 busy 计数，后续准入扫描将该会话计入；扫描包含归档中仍运行的会话。每轮 `capacity.json` 记录数量、上限、检查时间及满额时的下次检查时间。只读预检可用桥梁 `capacity` 命令或容量脚本；派发仍在锁内重查。不要绕过桥梁直接启动模型以规避名额，也不要靠不登记 subagent 规避名额。
+普通桥梁回合启动前调用 `scripts/swe_capacity.py`，固定上限 10；本机用户 LocalAppData 下的全局锁跨任务库共享。Lite 路径在锁内调用 `/api/bridge/turn/start`，响应前 Lite 已保留 busy 计数，后续准入扫描将该会话计入；扫描包含归档中仍运行的会话。每轮 `capacity.json` 记录数量、上限、检查时间及满额时的下次检查时间。只读预检可用桥梁 `capacity` 命令或容量脚本；普通派发仍在锁内重查。已有会话的外部主控 action 走桥梁 `__inject` 直投，不会启动另一个模型进程；不要靠直接启动模型或不登记 subagent 规避名额。
 
-Devin Lite（`D:\devin-lite`）侧已内置同口径自动化：`POST /api/prompt` 先做本机容量预检，满额直接进延期队列；发送或回合执行中遇到并发/配额类拒绝时同样入队，错误携带秒/分钟/小时或结构化期限时按 `期限+5s` 定时重发，否则每60秒（`DEVIN_LITE_RETRY_POLL_MS`）轮询容量空位；容量读不出时长时间停滞会慢速探针兜底。队列持久化在 `deferred-prompts.json`，经 `GET /api/queue`、`POST /api/queue/drop`、`GET /api/capacity` 查看与干预。该队列不持有全局准入锁，属尽力而为；桥梁派发仍走锁内准入。
+Devin Lite（`D:\devin-lite`）的网页主动消息和已有会话的外部主控 action 直接尝试投递；若后端拒绝，在原消息/桥梁 turn 上报告失败，不暗中排队。普通桥梁回合遇到并发/配额拒绝时进入延期队列，错误携带秒/分钟/小时或结构化期限时按 `期限+5s` 定时重发，最少等待 30 秒；无明确期限时按 30 秒容量复查节奏。网页默认展开所有 Lite 延期项，可逐条查看全文、手动重试或取消；接口为 `GET /api/queue|queue/item`、`POST /api/queue/send|drop`、`GET /api/capacity`。这只显示已经进入 Lite 的延期项；桥梁仍在 5 分钟容量等待中的普通回合记录在对应任务库的 `waiting_capacity`。该队列不持有全局准入锁，普通桥梁派发仍走锁内准入。
 
 ## 选择入口
 
@@ -67,7 +67,7 @@ devin list --format json
 
 每个参与者有稳定桥梁 ID，对应真实 Devin session ID、cwd、任务书、运行记录和结果。正常完成后保留 session，后续按精确 ID 继续；并行任务不使用 `--continue` 猜最近会话。
 
-默认运行中会话由 Lite 的单个 ACP 进程持有，桥梁 runner 只通过本机 HTTP 发起回合并长等状态，不再各启动一个 `devin --print`。**SWE→SWE 通信默认用普通 `send`**：它立即写入接收方邮箱，不建立下一轮 `turn`。若接收方本轮正通过 `wait --self <自己> --actor <发送者>` 等待，桥梁在最多约一秒的查询间隔后把未读消息直接作为该工具调用结果返回，接收方随即用 `inbox --read` 标记已读并继续当前轮；若接收方正忙于别的模型生成或工具调用，则在它下一次主动读邮箱时进入上下文。`send --action` 才建立后续任务，目标当前轮结束后由原 session 续做。已保存、已读取、已交给模型、已执行分别记录；即时到达邮箱不等于正在生成的模型已收到。GUI 的插话直接走同一 ACP session 的 prompt 入口；桥梁邮箱 `send` 仍维持协作消息语义，不冒充模型已即时接收。
+默认运行中会话由 Lite 的单个 ACP 进程持有，桥梁 runner 只通过本机 HTTP 发起回合并长等状态，不再各启动一个 `devin --print`。**SWE→SWE 通信默认用普通 `send`**：它立即写入接收方邮箱，不建立下一轮 `turn`。若接收方本轮正通过 `wait --self <自己> --actor <发送者>` 等待，桥梁在最多约一秒的查询间隔后把未读消息直接作为该工具调用结果返回，接收方随即用 `inbox --read` 标记已读并继续当前轮；若接收方正忙于别的模型生成或工具调用，则在它下一次主动读邮箱时进入上下文。Devin 同级的 `send --action` 建立后续任务，目标当前轮结束后由原 session 续做；**外部主控对已有会话的 `send --action` 直接经 Lite 发起独立插话回合**，不等 actor 普通 runner 结束。已保存、已读取、已交给模型、已执行分别记录；即时到达邮箱或 ACP 接受请求不等于正在生成的模型已收到。GUI 的插话直接走同一 ACP session 的 prompt 入口；桥梁邮箱 `send` 仍维持协作消息语义。
 
 **当前没有经验证的模型级 `session/inject` 能力。**Lite 允许把新 prompt 立即发给同一 ACP session，前端按独立消息呈现；这证明已投递请求，不证明它打断了正在生成的模型，也不保证模型何时应用。桥梁普通 `send` 仍只写邮箱；需要接收者当轮回应的同级咨询，配合 `wait` 或 `inbox --read`。需要接收者之后独立执行则发 `--action`。原生 CLI 的 `--resume` / ACP `session/prompt` 是轮次路径；再开一个进程抢占同一 session 不是直达。找不到目标或模型/认证不符时明确报错，不无上下文新建来冒充续跑。
 

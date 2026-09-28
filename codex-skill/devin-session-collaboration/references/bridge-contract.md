@@ -1,6 +1,6 @@
 # 会话桥梁设计与验收契约
 
-本页是 Codex 与 Devin 共用的通讯契约。程序入口为 `scripts/devin_bridge.py`，现役命令、架构与验证边界见 [桥梁 CLI](bridge-cli.md)。默认执行入口是 Devin Lite 的单个常驻 ACP：桥梁经本机 HTTP 发起和监视回合，SQLite 继续承担消息、结果与验收状态。SWE→SWE 的 action 在目标当前轮后续跑；SWE→Codex 的显式直达消息、最终报告和阻塞走原 Codex 宿主的 `send_message_to_thread` pipe。邮箱可在运行中主动读取；普通 `send` 的保存不等于模型已应用。
+本页是 Codex 与 Devin 共用的通讯契约。程序入口为 `scripts/devin_bridge.py`，现役命令、架构与验证边界见 [桥梁 CLI](bridge-cli.md)。默认执行入口是 Devin Lite 的单个常驻 ACP：桥梁经本机 HTTP 发起和监视回合，SQLite 继续承担消息、结果与验收状态。SWE→SWE 的 action 在目标当前轮后续跑；外部主控对已有 Devin 会话的 action 直接投递同一 ACP；SWE→Codex 的显式直达消息、最终报告和阻塞走原 Codex 宿主的 `send_message_to_thread` pipe。邮箱可在运行中主动读取；普通 `send` 的保存不等于模型已应用。
 
 ## 目标与边界
 
@@ -14,7 +14,7 @@
 |---|---|---|
 | 统一 CLI | 调用方提交任务/消息，读取状态与结果 | scripts/devin_bridge.py；参数见 bridge-cli.md |
 | 任务注册与邮箱 | 桥梁 ID、逻辑名称、真实 session ID、父/关联关系、原始任务、消息及投递状态 | 每任务 `bridge.sqlite3` 的 actors/messages/turns；`turns/<ID>/` 的导出与日志 |
-| 调度与运行 | 队列 → 桥梁 runner → Lite HTTP → 同一 ACP 的会话回合 → 状态/日志；同一 actor 同时仅一个 runner | `spawn_runner`, `runner_loop`, `run_lite_turn` |
+| 调度与运行 | 普通任务经桥梁 runner 排队进入 Lite；外部主控 action 对已有会话由独立跟踪进程直投同一 ACP，消息与结果仍在原任务库；同一 actor 的普通 runner 仍只有一个 | `spawn_runner`, `runner_loop`, `spawn_controller_interjection`, `controller_interjection`, `run_lite_turn` |
 | 验收记录 | 产物已报告 → 验收者实际复核 → 接受或带理由返工 | 验收人/时间/证据位置与对应结果版本 |
 | 主控事件唤醒 | 显式直达消息/最终报告/真实阻塞 → 持久 wake event → Codex app-tools 宿主发信；实际接收单独确认 | wake_events；`send`, `dispatch_wake`, `host_send`, `wake_ack`；普通 note/中间报告不触发 |
 
@@ -24,8 +24,8 @@
 
 - 发布：携带稳定项目/独立 checkout 根目录作为会话 cwd，任务书另写任务区绝对路径、目标、效果、必要材料和写入归属；返回稳定任务 ID，随后可异步获取真实 session ID、运行状态和结果。给接收者明确桥梁入口、自己的 ID、组织者 ID 和操作示例。任务子目录不是默认会话工作区，`--state` 也不决定工作区归属。
 - 发现：列出当前协作任务内的会话和角色/状态，以便执行者选择同级或组织者；读取状态不触发模型。
-- 消息：任意已注册参与者之间可发消息。普通 `send` 立即落邮箱，不建立后续轮次；接收方当前轮若正 `wait` 该发送者，约一个查询间隔内直接获得该工具返回，随后 `inbox --read` 标记已读。若接收方正在其他工作，须主动读取邮箱；桥梁不会把普通邮箱消息自动注入正在生成的模型。需执行的 `--action` 排到下一轮。Lite GUI 的插话直接作为同一 session 的另一条 prompt 发出，其可观察投递与模型应用仍分层记录。保留消息与已读/已交模型/已执行状态，不能静默丢信或把邮箱读取叫作自动 steer。
-- 续跑：空闲会话收到需执行的任务时按确定 session ID 继续上下文；占用时排队，不能并发打开同一会话或换新会话冒充恢复。消息投递和需要模型续跑的请求可以区分，避免普通确认触发无限对话循环。
+- 消息：任意已注册参与者之间可发消息。普通 `send` 立即落邮箱，不建立后续轮次；接收方当前轮若正 `wait` 该发送者，约一个查询间隔内直接获得该工具返回，随后 `inbox --read` 标记已读。若接收方正在其他工作，须主动读取邮箱；桥梁不会把普通邮箱消息自动注入正在生成的模型。Devin 同级的 `--action` 排到下一轮；外部主控对已有会话的 `--action` 与 Lite GUI 插话直接作为同一 session 的另一条 prompt 发出，其可观察投递与模型应用仍分层记录。保留消息与已读/已交模型/已执行状态，不能静默丢信或把邮箱读取叫作自动 steer。
+- 续跑：空闲会话收到普通需执行任务时按确定 session ID 继续上下文；普通任务占用时排队，主控插话可并行投递同一 ACP session，不能另开模型进程或换新会话冒充恢复。消息投递和需要模型续跑的请求可以区分，避免普通确认触发无限对话循环。
 - 回报：执行者自主做到结束后提交产物、证据和未决项，接收者能独立读到结果。父会话与同级均可接收；Codex 可直接读取而不启动模型。
 - 接受/返工：将结果版本、验收者、客观证据和结论记录在任务中。普通消息不需要审批；接受动作不凭一句“成功”自动完成。返工携带反证回到原会话。
 - 取消/关闭：默认只请求取消桥梁记录的 host turn；Lite 会在同 session 存在其他在途 prompt 时拒绝会话级取消，避免伤及 GUI 插话。保存取消/失败和现有产物；不用全局进程名终止，也不擅自删除正式会话。历史独立 CLI 任务只能由原 runner 按准确 actor 结束；新桥梁不创建此类进程。
