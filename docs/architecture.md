@@ -7,6 +7,7 @@
 | 进程与 ACP | `server.mjs` 持有一个 `devin acp`，按需另启一个 Cursor `agent acp`；两者的 ndjson JSON-RPC 转为同一 HTTP 与 SSE，桥梁只使用 Devin | 下文「ACP 与 HTTP」 |
 | Codex 协作入口 | 桥梁 runner 经本机 HTTP 进入同一 ACP；任务文件正文作为 prompt，`cwd` 只作为会话工作区 | 下文「桥梁回合」；仓库 `codex-skill/devin-session-collaboration/scripts/devin_bridge.py`，同步安装到本机 Codex skills 目录 |
 | 会话与历史 | Devin 列表与 Cursor 本地索引并列；各自 ACP 装载和回放进入服务端缓存，浏览器按轮读取；本机服务另存归档元数据 | 下文「会话与历史」 |
+| 外发消息记录 | 网页与桥梁发往 Devin 的正文先进入可见历史和本地只读显示日志；投递状态单独更新，ACP 回放对齐或补显，不触发重发 | 下文「会话与历史」；`outbound-journal.mjs` |
 | 工作区技能 | Devin 会话创建/装载前，将最近的父级显式共享技能链接到当前工作区的原生技能目录；已有同名项目技能保持优先 | 下文「ACP 与 HTTP」；`workspace-skills.mjs` |
 | 延期发送 | 普通桥梁回合遭 Devin 并发拒绝时进入持久队列；主控插话直接投递并单独报告失败 | 下文「延期发送」 |
 | 网页交互 | `public/index.html` 提供语义结构，`public/app.js` 消费 REST/SSE，`public/app.css` 负责响应式主题 | 下文「网页交互」 |
@@ -30,6 +31,7 @@
 | 模块 | 功能 | 源码定位 |
 |---|---|---|
 | 会话装载 | 每个供应方的 ACP 各自装载多个会话，维护在途和回放状态 | `server.mjs` 的 `DevinAcp.ensureLoaded`、`DevinAcp.newSession` |
+| 外发正文与状态 | `commitDeferred` 将完整正文作为用户消息广播并写入本地日志；投递中、待发送、回合结束、失败、取消分别更新；装载时与 ACP 用户消息去重，缺项只补显示 | `server.mjs` 的 `commitDeferred`、`outboundStatus`、`DevinAcp.ensureLoaded`；`outbound-journal.mjs` 的 `record`、`setStatus`、`mergeReplay`；`public/app.js` 的 `setUserMessageMeta`、`message-status` 事件处理 |
 | 新建会话 | 网页选 Devin 或 Cursor，并从已有目录、磁盘浏览器或路径输入选择工作区；服务端校验目录并交给对应 ACP | `public/app.js` 的 `openNewSessionDialog`、`updateNewSessionProvider`、`createNewSession`；`server.mjs` 的 `POST /api/sessions/new` |
 | 历史分页 | 将 ACP 更新分轮，按最新轮和更早轮返回 | `server.mjs` 的 `splitTurns`、`GET /api/history`；`public/app.js` 的 `renderHistoryTail`、`loadEarlier` |
 | 会话图片索引 | 从已装载会话正文发现仍存在的本机栅格图片路径，供当前会话 `@` 重用 | `server.mjs` 的 `RASTER_PATH_RE`、`GET /api/session-images`；`public/app.js` 的 `refreshSessionImages`、`imageRefsFor` |

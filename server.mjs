@@ -16,8 +16,10 @@ import { homedir } from 'node:os'
 import { join, resolve, isAbsolute, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { prepareWorkspaceSkills } from './workspace-skills.mjs'
+import { OutboundJournal } from './outbound-journal.mjs'
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url))
+const outboundJournal = new OutboundJournal(join(ROOT, 'outbound-messages.jsonl'))
 
 /** PID of the devin acp child we spawned — lets a later server reap orphans. */
 const PID_FILE = join(ROOT, 'devin-lite.acp.pid')
@@ -530,6 +532,10 @@ class DevinAcp {
     this.histories.set(sessionId, { updates: [], truncated: false })
     try {
       const result = await this.withAuth(() => this.request('session/load', { sessionId, cwd, mcpServers: [] }))
+      if (this.provider === 'devin') {
+        const history = this.histories.get(sessionId)
+        if (history) history.updates = outboundJournal.mergeReplay(sessionId, history.updates)
+      }
       this.loaded.set(sessionId, cwd)
       this.rememberConfig(sessionId, result?.configOptions)
       return this.provider === 'devin' ? { ...result, configOptions: visibleDevinConfigOptions(result?.configOptions),
@@ -987,13 +993,46 @@ function commitDeferred(entry) {
   if (entry.committed) return // a re-deferred send already pushed its copy
   const history = acp.histories.get(entry.sessionId)
   if (history === undefined) return
+  entry.messageId ??= entry.clientMessageId || entry.turnId || entry.queueId || `local-${Date.now()}-${++deferredSeq}`
+  const status = entry.state === 'queued' ? 'queued' : 'sending'
+  const source = entry.source === 'bridge' ? (entry.priority ? 'controller' : 'bridge') : 'gui'
+  const row = outboundJournal.record({ id: entry.messageId, sessionId: entry.sessionId,
+    text: entry.text, source, status, historyIndex: history.updates.length })
   for (const img of entry.images) {
     history.updates.push({ sessionUpdate: 'user_message_chunk', content: { type: 'image', data: img.data, mimeType: img.mimeType } })
   }
   if (entry.text.trim() !== '') {
-    history.updates.push({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: entry.text } })
+    const update = { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: entry.text },
+      lite: { id: row.id, source: row.source, status: row.status, createdAt: row.createdAt } }
+    history.updates.push(update)
+    acp.emit({ kind: 'update', sessionId: entry.sessionId, update })
+  }
+  if (history.updates.length > HISTORY_CAP) {
+    history.updates.splice(0, history.updates.length - HISTORY_CAP)
+    history.truncated = true
   }
   entry.committed = true
+}
+
+function outboundStatus(entry, status, error) {
+  if (!entry.messageId) return
+  let row
+  try { row = outboundJournal.setStatus(entry.messageId, status, error) }
+  catch (failure) {
+    log(`outbound status write failed: ${failure.message}`)
+    const message = `状态记录失败：${failure.message}`
+    const update = acp.histories.get(entry.sessionId)?.updates.find(u => u.lite?.id === entry.messageId)
+    if (update) update.lite = { ...update.lite, status: 'unknown', error: message }
+    acp.emit({ kind: 'message-status', sessionId: entry.sessionId, messageId: entry.messageId,
+      status: 'unknown', error: message })
+    return
+  }
+  if (!row) return
+  const history = acp.histories.get(entry.sessionId)
+  const update = history?.updates.find(u => u.lite?.id === entry.messageId)
+  if (update) update.lite = { ...update.lite, status: row.status, error: row.error, changedAt: row.changedAt }
+  acp.emit({ kind: 'message-status', sessionId: entry.sessionId, messageId: entry.messageId,
+    status: row.status, error: row.error, changedAt: row.changedAt })
 }
 
 function deferPrompt(entry, reason, retryAfterMs) {
@@ -1002,6 +1041,7 @@ function deferPrompt(entry, reason, retryAfterMs) {
   entry.retryAt = Date.now() + Math.max(MIN_RETRY_MS, Number.isFinite(retryAfterMs) ? retryAfterMs : 0)
   entry.state = 'queued'
   commitDeferred(entry)
+  outboundStatus(entry, 'queued', entry.lastError)
   // A re-deferred entry keeps its position so a session's queued messages
   // cannot be overtaken by their own later prompts.
   if (!deferred.includes(entry)) deferred.push(entry)
@@ -1062,10 +1102,15 @@ async function dispatchPrompt(entry) {
     // Commit the user message to the history buffer up front — committed
     // stays truthful however the send then fails (even pre-request), so a
     // re-deferred entry never duplicates or loses its transcript row.
+    await acp.ensureLoaded(sessionId, entry.cwd)
     commitDeferred(entry)
+    outboundStatus(entry, 'sending')
     const response = await acp.prompt(sessionId, entry.cwd, entry.text, entry.images, !entry.committed, ep)
     settle()
     removeQueued(entry)
+    const turnCancelled = entry.turnId !== undefined && bridgeTurns.get(entry.turnId)?.status === 'cancelled'
+    outboundStatus(entry, turnCancelled
+      ? (response.stopReason === 'cancelled' ? 'cancelled' : 'unknown') : 'completed')
     acp.emit({
       kind: 'prompt-done', sessionId, stopReason: response.stopReason, usage: response.usage,
       ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}),
@@ -1086,6 +1131,8 @@ async function dispatchPrompt(entry) {
     }
     removeQueued(entry)
     const message = String(error.message ?? error)
+    const turnCancelled = entry.turnId !== undefined && bridgeTurns.get(entry.turnId)?.status === 'cancelled'
+    outboundStatus(entry, turnCancelled ? 'unknown' : 'failed', message)
     acp.emit({
       kind: 'prompt-done', sessionId, error: message, code: error.code,
       ...(entry.clientMessageId !== undefined ? { clientMessageId: entry.clientMessageId } : {}),
@@ -1713,6 +1760,7 @@ const routes = {
       if (deferred.length !== before) { saveQueue(); acp.emit({ kind: 'queue', pending: deferred.length }) }
       acp.notify('session/cancel', { sessionId: turn.sessionId })
       turnSet(turn, 'cancelled')
+      outboundStatus({ messageId: turn.turnId, sessionId: turn.sessionId }, 'cancel_requested')
       return turnView(turn)
     }
     // deferred: this turn is not in flight — drop only its own queued retry.
@@ -1720,6 +1768,7 @@ const routes = {
     deferred = deferred.filter(e => e.turnId !== turn.turnId)
     if (deferred.length !== before) { saveQueue(); acp.emit({ kind: 'queue', pending: deferred.length }) }
     turnSet(turn, 'cancelled')
+    outboundStatus({ messageId: turn.turnId, sessionId: turn.sessionId }, 'cancelled')
     return turnView(turn)
   },
 
@@ -1783,10 +1832,13 @@ const routes = {
    */
   'POST /api/queue/drop': async (req) => {
     const { queueId, sessionId } = await readBody(req)
+    const removed = deferred.filter(e => e.state !== 'sending'
+      && (e.queueId === queueId || (queueId === undefined && e.sessionId === sessionId)))
     const before = deferred.length
     deferred = deferred.filter(e => e.state === 'sending'
       || !(e.queueId === queueId || (queueId === undefined && e.sessionId === sessionId)))
     if (deferred.length !== before) {
+      for (const entry of removed) outboundStatus(entry, 'cancelled')
       saveQueue()
       acp.emit({ kind: 'queue', pending: deferred.length })
       if (queueId !== undefined) {

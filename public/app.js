@@ -702,6 +702,32 @@ function renderRefText(span, text) {
   if (cursor < text.length) span.appendChild(document.createTextNode(text.slice(cursor)))
 }
 
+const MESSAGE_SOURCE = { controller: '主控协作', bridge: '协作桥梁', gui: '网页' }
+const MESSAGE_STATUS = { queued: '待发送', sending: '正在投递', completed: '回合结束',
+  failed: '投递失败', cancel_requested: '已请求取消', cancelled: '已取消', unknown: '投递状态待核实' }
+
+function setUserMessageMeta(div, lite) {
+  if (!div || !lite?.id) return
+  div.dataset.liteMessageId = lite.id
+  let meta = div.querySelector(':scope > .msg-meta')
+  if (!meta) {
+    meta = document.createElement('div')
+    meta.className = 'msg-meta'
+    div.prepend(meta)
+  }
+  meta.textContent = `${MESSAGE_SOURCE[lite.source] ?? 'Devin'} · ${MESSAGE_STATUS[lite.status] ?? '状态未知'}`
+  meta.title = [lite.createdAt, lite.changedAt, lite.error].filter(Boolean).join('\n')
+  div.classList.toggle('failed', lite.status === 'failed')
+}
+
+function updateUserMessageStatus(messageId, status, error, changedAt) {
+  const div = [...$('transcript').querySelectorAll('.msg.user')]
+    .find(row => row.dataset.liteMessageId === messageId)
+  if (!div) return
+  const source = div.dataset.liteSource ?? 'gui'
+  setUserMessageMeta(div, { id: messageId, source, status, error, changedAt })
+}
+
 /**
  * Render one transcript-producing update into `container` using run state `st`.
  * Session-level metadata is handled separately by {@link applyMetaUpdate}.
@@ -718,12 +744,20 @@ function renderUpdate(u, st, container) {
       const c = u.content ?? (typeof u.text === 'string' ? { type: 'text', text: u.text } : undefined)
       if (c?.type !== 'text' && c?.type !== 'image' && c?.type !== 'resource_link' && c?.type !== 'resource') break
       closeRun(st, 'user')
+      if (u.lite?.id && st.userEl?.parentElement?.dataset.liteMessageId !== u.lite.id) {
+        st.userEl = null
+        st.userBuf = ''
+      }
       if (!st.userEl) {
         const div = document.createElement('div')
         div.className = 'msg user'
         div.innerHTML = '<div class="body"></div>'
         container.appendChild(div)
         st.userEl = div.querySelector('.body')
+      }
+      if (u.lite?.id) {
+        st.userEl.parentElement.dataset.liteSource = u.lite.source ?? 'gui'
+        setUserMessageMeta(st.userEl.parentElement, u.lite)
       }
       if (c.type === 'text') {
         st.userBuf += c.text
@@ -814,6 +848,7 @@ function handleUpdate(ev) {
       if (!pending.text.startsWith(next)) continue
       pending.buf = next
       if (next === pending.text) state.pendingEchoes.splice(state.pendingEchoes.indexOf(pending), 1)
+      if (u.lite?.id) updateUserMessageStatus(u.lite.id, u.lite.status, u.lite.error, u.lite.changedAt)
       return // devin echoed an optimistic prompt back
     }
   }
@@ -2091,7 +2126,9 @@ async function send() {
   // The optimistic echo shows exactly the text and paths sent to Devin.
   if ($('transcript').childElementCount > 0) turnSep($('transcript'), undefined, state.stream)
   else closeRun(state.stream, 'sep')
-  renderUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } }, state.stream, $('transcript'))
+  renderUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text },
+    lite: { id: clientMessageId, source: 'gui', status: 'sending', createdAt: new Date().toISOString() } },
+  state.stream, $('transcript'))
   state.pendingSends.set(clientMessageId, {
     sessionId, text: rawText, atts, expanded: text, bubble: state.stream.userEl?.parentElement,
   })
@@ -2150,6 +2187,7 @@ function markUserFailed(clientMessageId) {
   if (!ue || ue.querySelector('.undo-btn')) return
   if (pending) pending.failed = true
   ue.classList.add('failed')
+  if (clientMessageId) updateUserMessageStatus(clientMessageId, 'failed')
   const btn = document.createElement('button')
   btn.className = 'undo-btn'
   btn.textContent = '↩ 撤回'
@@ -2306,6 +2344,10 @@ function connectEvents() {
         else if (ev.stopReason && ev.stopReason !== 'end_turn') addNote(`回合结束：${ev.stopReason}`, 'warn')
         break
       }
+      case 'message-status':
+        if (ev.sessionId === state.active?.sessionId)
+          updateUserMessageStatus(ev.messageId, ev.status, ev.error, ev.changedAt)
+        break
       case 'agent-down':
         showAgentOffline(ev.message, ev.provider ?? 'devin')
         if ((ev.provider ?? 'devin') === providerOf(state.active?.sessionId))
