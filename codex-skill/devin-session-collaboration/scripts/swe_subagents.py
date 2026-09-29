@@ -1,8 +1,8 @@
-"""Reserve a Devin slot before run_subagent; release it when the child ends.
+"""Reserve a SWE slot before a SWE run_subagent; release it when the child ends.
 
 A run_subagent child has no separate process or session row. The launching
-session must reserve its slot here before invoking the tool so simultaneous
-creators cannot exceed the shared limit.
+session must reserve its SWE slot here before invoking the tool so simultaneous
+SWE creators cannot exceed the five-slot SWE limit. Other models do not reserve.
 """
 from __future__ import annotations
 import argparse

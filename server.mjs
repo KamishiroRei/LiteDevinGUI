@@ -36,16 +36,39 @@ function processImage(pid) {
 const PUBLIC_DIR = join(ROOT, 'public')
 const PORT = Number(process.env.DEVIN_LITE_PORT ?? process.argv[2] ?? 8317)
 const DEVIN_EXE = process.env.DEVIN_EXE ?? 'devin'
+const CURSOR_AGENT_SCRIPT = process.env.CURSOR_AGENT_SCRIPT
+  ?? join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'cursor-agent', 'agent.ps1')
+const CURSOR_PID_FILE = join(ROOT, 'cursor-lite.acp.pid')
+const CURSOR_PREFIX = 'cursor:'
+const isCursorSession = (sessionId) => typeof sessionId === 'string' && sessionId.startsWith(CURSOR_PREFIX)
+const rawSessionId = (sessionId) => isCursorSession(sessionId) ? sessionId.slice(CURSOR_PREFIX.length) : sessionId
+const publicSessionId = (provider, sessionId) => provider === 'cursor' ? CURSOR_PREFIX + sessionId : sessionId
+function devinModelKind(value, label = '') {
+  const name = `${value ?? ''} ${label ?? ''}`.toLowerCase()
+  if (/(^|[^a-z])swe(?:[-_\s\d]|$)/.test(name)) return 'swe'
+  if (/(?:sonnet|opus)[^\n]{0,40}5[.\-_\s]?5(?:\b|$)/.test(name)) return 'other'
+  return name.trim() ? 'blocked' : 'unknown'
+}
+function visibleDevinConfigOptions(configOptions) {
+  if (!Array.isArray(configOptions)) return configOptions
+  return configOptions.map(option => {
+    if (option?.id !== 'model' && option?.category !== 'model') return option
+    const options = Array.isArray(option.options) ? option.options.filter(choice =>
+      ['swe', 'other'].includes(devinModelKind(choice?.value, choice?.name))) : []
+    return { ...option, options,
+      currentValue: options.some(choice => choice.value === option.currentValue) ? option.currentValue : undefined }
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Capacity gate for ordinary deferred bridge work
 // ---------------------------------------------------------------------------
 // The local gate runs swe_capacity.py (busy lite sessions + CLI invocations +
 // self-registered subagents, same accounting the bridge uses). GUI sends and
-// external-controller interjections bypass this queue but still obey the
-// shared concurrency ceiling when they would start a new active session.
+// external-controller interjections bypass this queue; only SWE turns need
+// an available SWE slot when they would start a new active session.
 const CAPACITY_SCRIPT = process.env.DEVIN_LITE_CAPACITY_SCRIPT
-  ?? 'C:\\Users\\ASUS\\.codex\\skills\\devin-session-collaboration\\scripts\\swe_capacity.py'
+  ?? join(ROOT, 'codex-skill', 'devin-session-collaboration', 'scripts', 'swe_capacity.py')
 const CAPACITY_PYTHON = process.env.DEVIN_LITE_PYTHON ?? 'python'
 /** Hard bound even if an installed capacity script is older. */
 const CAPACITY_FALLBACK_LIMIT = 5
@@ -69,6 +92,7 @@ const log = (...args) => console.log(`[devin-lite ${new Date().toISOString().sli
 // ---------------------------------------------------------------------------
 
 class DevinAcp {
+  constructor(provider = 'devin') { this.provider = provider }
   child = undefined
   nextId = 0
   /** id -> { resolve, reject } for client->agent requests. */
@@ -83,6 +107,10 @@ class DevinAcp {
   restarting = undefined
   /** sessionId -> cwd for sessions loaded/created in this process. */
   loaded = new Map()
+  configBySession = new Map()
+  /** Devin sessionId -> selected model; only SWE turns consume the five slots. */
+  models = new Map()
+  modelChoices = new Map()
   /**
    * sessionId -> buffered update list. `session/load` replays full history as
    * updates; buffering lets the client page in only the turns it renders.
@@ -92,6 +120,7 @@ class DevinAcp {
   loading = new Set()
   /** sessionId -> in-flight session/prompt count (interjections share a session). */
   busy = new Map()
+  sweBusy = new Map()
   /**
    * sessionId -> FIFO of { text, buf, images } suppression records, one per
    * in-flight prompt. Sent messages are pushed into the history buffer
@@ -105,6 +134,13 @@ class DevinAcp {
   listeners = new Set()
 
   emit(payload) {
+    if (this.provider === 'cursor') {
+      payload = { ...payload, provider: 'cursor',
+        ...(typeof payload.sessionId === 'string' ? { sessionId: publicSessionId('cursor', payload.sessionId) } : {}),
+        ...(payload.kind === 'permission' && payload.requestId !== undefined
+          ? { requestId: `${CURSOR_PREFIX}${payload.requestId}` } : {}),
+      }
+    }
     for (const sink of this.listeners) {
       try { sink(payload) } catch { /* a dead SSE sink is removed on write error */ }
     }
@@ -117,7 +153,7 @@ class DevinAcp {
   request(method, params, timeoutMs = 0) {
     const child = this.child
     if (child === undefined || child.killed || child.exitCode !== null || child.stdin.destroyed) {
-      return Promise.reject(Object.assign(new Error('devin acp is not running'), { agentDown: true }))
+      return Promise.reject(Object.assign(new Error(`${this.provider} acp is not running`), { agentDown: true }))
     }
     const id = `c-${++this.nextId}`
     return new Promise((resolvePromise, reject) => {
@@ -153,14 +189,27 @@ class DevinAcp {
     })
   }
 
+  rememberConfig(sessionId, configOptions) {
+    if (!Array.isArray(configOptions)) return
+    this.configBySession.set(sessionId, configOptions)
+    if (this.provider !== 'devin') return
+    const option = configOptions.find(o => o?.id === 'model' || o?.category === 'model')
+    if (!option) return
+    if (Array.isArray(option.options)) this.modelChoices.set(sessionId,
+      new Map(option.options.map(choice => [choice.value, choice.name ?? ''])))
+    if (typeof option.currentValue === 'string') this.models.set(sessionId, option.currentValue)
+  }
+
   notify(method, params) {
     this.send({ jsonrpc: '2.0', method, params })
   }
 
   /** Answer one agent->client request we chose to keep open (permissions). */
   answer(requestId, result) {
-    if (!this.inbound.delete(requestId)) return false
-    this.send({ jsonrpc: '2.0', id: requestId, result })
+    const key = [...this.inbound.keys()].find(id => String(id) === String(requestId))
+    if (key === undefined) return false
+    this.inbound.delete(key)
+    this.send({ jsonrpc: '2.0', id: key, result })
     return true
   }
 
@@ -192,6 +241,11 @@ class DevinAcp {
   async authenticate() {
     const method = this.authMethods[0]
     if (method === undefined) throw new Error('agent advertised no auth methods')
+    if (this.provider === 'cursor') {
+      await this.request('authenticate', { methodId: method.id })
+      this.authed = true
+      return
+    }
     const apiKey = process.env.WINDSURF_API_KEY ?? this.storedApiKey()
     await this.request('authenticate', {
       methodId: method.id,
@@ -226,36 +280,45 @@ class DevinAcp {
     // Reap an acp child orphaned by a previous devin-lite server: it still
     // holds its session locks and would poison every session/load. Only kill
     // when the PID is really a devin process (guards against PID reuse).
-    try {
-      const stale = Number(readFileSync(PID_FILE, 'utf8').trim())
-      if (Number.isInteger(stale) && stale > 0 && /devin/i.test(processImage(stale))) {
-        log('reaping orphaned devin acp', stale)
-        killTree(stale)
-      }
-    } catch { /* no stale pid marker */ }
+    const pidFile = this.provider === 'cursor' ? CURSOR_PID_FILE : PID_FILE
+    if (this.provider === 'devin') {
+      try {
+        const stale = Number(readFileSync(pidFile, 'utf8').trim())
+        if (Number.isInteger(stale) && stale > 0 && /devin/i.test(processImage(stale))) {
+          log('reaping orphaned devin acp', stale)
+          killTree(stale)
+        }
+      } catch { /* no stale pid marker */ }
+    }
 
     const env = { ...process.env }
     for (const key of Object.keys(env)) {
       if (AMBIENT_TOMBSTONE.test(key)) delete env[key]
     }
-    const child = spawn(DEVIN_EXE, ['acp'], {
+    if (this.provider === 'cursor' && !existsSync(CURSOR_AGENT_SCRIPT)) {
+      throw new Error('Cursor CLI 未安装；请先安装官方 agent CLI')
+    }
+    const command = this.provider === 'cursor' ? 'powershell.exe' : DEVIN_EXE
+    const args = this.provider === 'cursor'
+      ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', CURSOR_AGENT_SCRIPT, 'acp'] : ['acp']
+    const child = spawn(command, args, {
       cwd: ROOT,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
     })
     this.child = child
-    try { writeFileSync(PID_FILE, String(child.pid)) } catch { /* marker is best-effort */ }
+    try { writeFileSync(pidFile, String(child.pid)) } catch { /* marker is best-effort */ }
     child.stderr.on('data', (chunk) => {
       const line = String(chunk).trimEnd()
-      if (line.length > 0) log('devin stderr:', line.slice(0, 300))
+      if (line.length > 0) log(`${this.provider} stderr:`, line.slice(0, 300))
     })
     child.on('error', (error) => {
-      log('devin spawn error:', error.message)
+      log(`${this.provider} spawn error:`, error.message)
       this.teardown(child, error)
     })
     child.on('close', (code, signal) => {
-      log('devin acp exited', code ?? signal)
-      this.teardown(child, Object.assign(new Error(`devin acp exited (code ${code ?? signal})`), { agentDown: true }))
+      log(`${this.provider} acp exited`, code ?? signal)
+      this.teardown(child, Object.assign(new Error(`${this.provider} acp exited (code ${code ?? signal})`), { agentDown: true }))
     })
     const rl = createInterface({ input: child.stdout })
     rl.on('line', (line) => { if (this.child === child) this.onLine(line) })
@@ -270,7 +333,7 @@ class DevinAcp {
       this.capabilities = init.agentCapabilities ?? {}
       this.authMethods = init.authMethods ?? []
       this.agentInfo = init.agentInfo ?? {}
-      log('devin acp ready:', this.agentInfo.name ?? 'agent', this.agentInfo.version ?? '')
+      log(`${this.provider} acp ready:`, this.agentInfo.name ?? 'agent', this.agentInfo.version ?? '')
       this.emit({ kind: 'agent-ready', agentInfo: this.agentInfo })
     } catch (error) {
       if (this.child === child) {
@@ -290,16 +353,21 @@ class DevinAcp {
     this.pending.clear()
     this.inbound.clear()
     this.loaded.clear()
+    this.configBySession.clear()
+    this.models.clear()
+    this.modelChoices.clear()
     this.histories.clear()
     this.loading.clear()
     this.echoPending.clear()
+    this.sweBusy.clear()
     this.child = undefined
     this.authed = false
     this.agentInfo = {}
     this.capabilities = {}
     this.authMethods = []
     try {
-      if (childPid !== undefined && readFileSync(PID_FILE, 'utf8').trim() === String(childPid)) unlinkSync(PID_FILE)
+      const pidFile = this.provider === 'cursor' ? CURSOR_PID_FILE : PID_FILE
+      if (childPid !== undefined && readFileSync(pidFile, 'utf8').trim() === String(childPid)) unlinkSync(pidFile)
     } catch { /* marker already gone */ }
     for (const { reject } of failed) reject(error)
     this.emit({ kind: 'agent-down', message: String(error.message ?? error) })
@@ -312,7 +380,7 @@ class DevinAcp {
       if (this.starting !== undefined) await this.starting.catch(() => {})
       const child = this.child
       if (child !== undefined) {
-        if (this.busy.size > 0) throw httpError(409, 'Devin 正在处理回合，请等待完成后再重启')
+        if (this.busy.size > 0) throw httpError(409, `${this.provider === 'cursor' ? 'Cursor' : 'Devin'} 正在处理回合，请等待完成后再重启`)
         const closed = new Promise((resolveClosed) => {
           let timer
           const done = () => { clearTimeout(timer); resolveClosed() }
@@ -354,6 +422,10 @@ class DevinAcp {
     if (message.method === 'session/update') {
       const params = message.params
       let update = params.update
+      if (update?.sessionUpdate === 'config_option_update') {
+        this.rememberConfig(params.sessionId, update.configOptions)
+        if (this.provider === 'devin') update = { ...update, configOptions: visibleDevinConfigOptions(update.configOptions) }
+      }
       // Swallow devin's live echo of a prompt we already buffered synthetically.
       const echos = this.echoPending.get(params.sessionId)
       if (echos !== undefined && update.sessionUpdate === 'user_message_chunk') {
@@ -405,10 +477,16 @@ class DevinAcp {
   }
 
   onAgentRequest(message) {
+    if (this.provider === 'cursor' && ['cursor/ask_question', 'cursor/create_plan'].includes(message.method)) {
+      this.inbound.set(message.id, { method: message.method, params: message.params })
+      this.emit({ kind: 'cursor-request', requestId: `${CURSOR_PREFIX}${message.id}`,
+        method: message.method, params: message.params })
+      return
+    }
     if (message.method === 'session/request_permission') {
       // Bridge 'bypass' sessions auto-approve — the ACP equivalent of the
       // CLI's --permission-mode dangerous. GUI sessions keep the manual flow.
-      if (autoApproveSessions.has(message.params?.sessionId)) {
+      if (this.provider === 'devin' && autoApproveSessions.has(message.params?.sessionId)) {
         const options = Array.isArray(message.params.options) ? message.params.options : []
         const pick = options.find(o =>
           /allow|always|approve|accept|yes/i.test(`${o.optionId ?? ''} ${o.name ?? ''} ${o.kind ?? ''}`))
@@ -436,14 +514,21 @@ class DevinAcp {
     try { await this.ensure() } catch (error) {
       throw Object.assign(error instanceof Error ? error : new Error(String(error)), { agentDown: true })
     }
-    if (this.loaded.has(sessionId)) return
+    if (this.loaded.has(sessionId)) {
+      const options = this.configBySession.get(sessionId)
+      return options === undefined ? { alreadyLoaded: true } : {
+        alreadyLoaded: true,
+        configOptions: this.provider === 'devin' ? visibleDevinConfigOptions(options) : options,
+      }
+    }
     // Replay updates buffer for paging; a fresh buffer replaces a stale one.
     this.loading.add(sessionId)
     this.histories.set(sessionId, { updates: [], truncated: false })
     try {
       const result = await this.withAuth(() => this.request('session/load', { sessionId, cwd, mcpServers: [] }))
       this.loaded.set(sessionId, cwd)
-      return result
+      this.rememberConfig(sessionId, result?.configOptions)
+      return this.provider === 'devin' ? { ...result, configOptions: visibleDevinConfigOptions(result?.configOptions) } : result
     } finally {
       this.loading.delete(sessionId)
       this.emit({ kind: 'history-ready', sessionId })
@@ -454,7 +539,25 @@ class DevinAcp {
     const created = await this.withAuth(() => this.request('session/new', { cwd, mcpServers: [] }))
     this.loaded.set(created.sessionId, cwd)
     this.histories.set(created.sessionId, { updates: [], truncated: false })
-    return created
+    this.rememberConfig(created.sessionId, created.configOptions)
+    if (this.provider !== 'devin') return created
+    const model = this.models.get(created.sessionId)
+    if (!['swe', 'other'].includes(devinModelKind(model, this.modelChoices.get(created.sessionId)?.get(model)))) {
+      const allowed = [...(this.modelChoices.get(created.sessionId) ?? [])]
+        .filter(([value, name]) => ['swe', 'other'].includes(devinModelKind(value, name)))
+      const chosen = allowed.find(([value]) => value === 'swe-2-high') ?? allowed[0]
+      if (chosen) {
+        try {
+          await this.request('session/set_config_option', { sessionId: created.sessionId, configId: 'model', value: chosen[0] })
+          this.models.set(created.sessionId, chosen[0])
+        } catch (error) { log('new Devin session needs manual model selection:', error.message) }
+      }
+    }
+    const configOptions = (created.configOptions ?? []).map(option =>
+      option?.id === 'model' || option?.category === 'model'
+        ? { ...option, currentValue: this.models.get(created.sessionId) } : option)
+    this.configBySession.set(created.sessionId, configOptions)
+    return { ...created, configOptions: visibleDevinConfigOptions(configOptions) }
   }
 
   async prompt(sessionId, cwd, text, images = [], commit = true, echo) {
@@ -490,6 +593,34 @@ class DevinAcp {
 const HISTORY_CAP = 4000
 
 const acp = new DevinAcp()
+const cursorAcp = new DevinAcp('cursor')
+const CURSOR_SESSIONS_FILE = join(ROOT, 'cursor-sessions.json')
+let cursorSessions = (() => {
+  try {
+    const rows = JSON.parse(readFileSync(CURSOR_SESSIONS_FILE, 'utf8'))?.sessions
+    return rows && typeof rows === 'object' && !Array.isArray(rows) ? rows : {}
+  } catch { return {} }
+})()
+function saveCursorSessions() {
+  writeFileSync(CURSOR_SESSIONS_FILE, JSON.stringify({ version: 1, sessions: cursorSessions }))
+}
+function targetSession(sessionId) {
+  if (typeof sessionId !== 'string' || !sessionId) throw httpError(400, 'sessionId required')
+  if (isCursorSession(sessionId)) {
+    const raw = rawSessionId(sessionId)
+    if (!raw) throw httpError(400, 'Cursor sessionId required')
+    return { host: cursorAcp, raw, provider: 'cursor' }
+  }
+  return { host: acp, raw: sessionId, provider: 'devin' }
+}
+cursorAcp.listeners.add(payload => {
+  if (payload.kind !== 'update' || payload.update?.sessionUpdate !== 'session_info_update') return
+  const row = cursorSessions[payload.sessionId]
+  if (!row || typeof payload.update.title !== 'string') return
+  row.title = payload.update.title
+  row.updatedAt = new Date().toISOString()
+  try { saveCursorSessions() } catch (error) { log('cursor session index write failed:', error.message) }
+})
 
 /**
  * Split buffered updates into turns: a new turn opens at the first user
@@ -566,6 +697,12 @@ function bridgeText(sessionId, cwd, updates) {
 
 const sseClients = new Set()
 acp.listeners.add((payload) => {
+  const frame = `data: ${JSON.stringify(payload)}\n\n`
+  for (const res of sseClients) {
+    try { res.write(frame) } catch { sseClients.delete(res) }
+  }
+})
+cursorAcp.listeners.add((payload) => {
   const frame = `data: ${JSON.stringify(payload)}\n\n`
   for (const res of sseClients) {
     try { res.write(frame) } catch { sseClients.delete(res) }
@@ -757,18 +894,21 @@ function capacitySnapshot() {
 // Serialise every Lite dispatch decision. dispatchPrompt marks a session busy
 // synchronously, so the next check can observe the slot before it is released.
 let admissionTail = Promise.resolve()
-async function withCapacityAdmission(sessionId, start) {
+async function withCapacityAdmission(sessionId, start, modelId) {
+  const kind = devinModelKind(modelId, acp.modelChoices.get(sessionId)?.get(modelId))
+  if (kind === 'other') return start()
+  if (kind !== 'swe') throw httpError(422, '请先在 Devin 模型栏选择 SWE、Sonnet 5.5 或 Opus 5.5')
   let release
   const previous = admissionTail
   admissionTail = new Promise(resolvePromise => { release = resolvePromise })
   await previous
   try {
     // A controller interjection to an already running session adds no session.
-    if (!acp.busy.has(sessionId)) {
+    if (!acp.sweBusy.has(sessionId)) {
       const cap = await capacitySnapshot()
-      if (cap === null) throw httpError(503, '无法确认 Devin 并发状态，请稍后重试')
+      if (cap === null) throw httpError(503, '无法确认 SWE 并发状态，请稍后重试')
       if (cap.active >= CAPACITY_FALLBACK_LIMIT) {
-        throw httpError(409, `Devin 并发已达上限 ${cap.active}/${CAPACITY_FALLBACK_LIMIT}`, { capacity: cap })
+        throw httpError(409, `SWE 并发已达上限 ${cap.active}/${CAPACITY_FALLBACK_LIMIT}`, { capacity: cap })
       }
     }
     return await start()
@@ -888,6 +1028,8 @@ function removeQueued(entry) {
 async function dispatchPrompt(entry) {
   const { sessionId } = entry
   entry.state = 'sending'
+  const swe = devinModelKind(entry.model ?? acp.models.get(sessionId)) === 'swe'
+  if (swe) acp.sweBusy.set(sessionId, (acp.sweBusy.get(sessionId) ?? 0) + 1)
   // Refcounted busy: a session stays "running" until its LAST in-flight
   // prompt settles — an early-finishing interjection must not expose the
   // still-running sibling to the capacity gate or the queue pump.
@@ -898,6 +1040,10 @@ async function dispatchPrompt(entry) {
   // never a sibling interjection still in flight on the same session.
   const ep = { text: entry.text, buf: '', images: entry.images.length }
   const settle = () => {
+    if (swe) {
+      const count = (acp.sweBusy.get(sessionId) ?? 1) - 1
+      if (count <= 0) acp.sweBusy.delete(sessionId); else acp.sweBusy.set(sessionId, count)
+    }
     const n = (acp.busy.get(sessionId) ?? 1) - 1
     if (n <= 0) acp.busy.delete(sessionId); else acp.busy.set(sessionId, n)
     acp.dropEcho(sessionId, ep)
@@ -972,8 +1118,10 @@ async function pumpDeferred() {
     // No capacity probe until at least one entry is actually dispatchable:
     // entries waiting out an advertised retry deadline must not be sent early.
     if (!deferred.some(e => e.state === 'queued' && (e.retryAt ?? 0) <= Date.now() && !acp.busy.has(e.sessionId))) return
-    const cap = await capacitySnapshot()
-    lastCapacity = cap === null ? { error: 'capacity check failed', at: Date.now() } : cap
+    const needsSweSlot = deferred.some(e => e.state === 'queued' && (e.retryAt ?? 0) <= Date.now()
+      && devinModelKind(e.model ?? 'swe-2-high') === 'swe')
+    const cap = needsSweSlot ? await capacitySnapshot() : null
+    if (needsSweSlot) lastCapacity = cap === null ? { error: 'capacity check failed', at: Date.now() } : cap
     let slots = cap === null ? 0 : Math.max(0, cap.limit - cap.active)
     const blocked = new Set()
     for (const entry of deferred) {
@@ -987,7 +1135,8 @@ async function pumpDeferred() {
       }
       if ((entry.retryAt ?? 0) > Date.now()) { blocked.add(entry.sessionId); continue }
       entry.lastCheckAt = Date.now()
-      if (slots <= 0) { blocked.add(entry.sessionId); continue }
+      const swe = devinModelKind(entry.model ?? 'swe-2-high') === 'swe'
+      if (swe && slots <= 0) { blocked.add(entry.sessionId); continue }
       try {
         await withCapacityAdmission(entry.sessionId, () => {
           entry.attempts++
@@ -1002,8 +1151,8 @@ async function pumpDeferred() {
           }
           log(`dispatching deferred prompt for ${entry.sessionId} (attempt ${entry.attempts})`)
           void dispatchPrompt(entry)
-        })
-        slots--
+        }, entry.model ?? 'swe-2-high')
+        if (swe) slots--
       } catch { blocked.add(entry.sessionId) } // still full or unreadable; keep queued
     }
     saveQueue()
@@ -1162,18 +1311,30 @@ const routes = {
   'GET /api/health': async () => ({
     ok: true,
     agent: acp.starting !== undefined ? 'starting' : acp.child === undefined ? 'stopped' : 'running',
+    cursor: cursorAcp.starting !== undefined ? 'starting' : cursorAcp.child === undefined ? 'stopped' : 'running',
   }),
 
-  'GET /api/status': async () => {
-    await acp.ensure()
+  'GET /api/status': async (_req, query) => {
+    const host = query.get('provider') === 'cursor' ? cursorAcp : acp
+    await host.ensure()
     return {
-      agentInfo: acp.agentInfo,
-      capabilities: acp.capabilities,
-      authed: acp.authed,
+      provider: host.provider,
+      agentInfo: host.agentInfo,
+      capabilities: host.capabilities,
+      authed: host.authed,
     }
   },
 
-  'POST /api/agent/restart': async () => acp.restart(),
+  'POST /api/agent/restart': async (req) => {
+    const { provider } = await readBody(req)
+    return (provider === 'cursor' ? cursorAcp : acp).restart()
+  },
+
+  'GET /api/agent/pending': async () => ({
+    cursor: [...cursorAcp.inbound].filter(([, rec]) => rec?.method?.startsWith('cursor/'))
+      .map(([id, rec]) => ({ kind: 'cursor-request', requestId: `${CURSOR_PREFIX}${id}`,
+        method: rec.method, params: rec.params })),
+  }),
 
   /**
    * Session list passthrough with server-side flags: `_busy` (a turn is
@@ -1185,22 +1346,37 @@ const routes = {
    * cursor is returned.
    */
   'GET /api/sessions': async (_req, query) => {
-    await acp.ensure()
     const params = {}
     if (query.get('cursor')) params.cursor = query.get('cursor')
     if (query.get('cwd')) params.cwd = query.get('cwd')
-    const result = await acp.request('session/list', params)
+    let result
+    try {
+      await acp.ensure()
+      result = await acp.request('session/list', params)
+    } catch (error) {
+      if (Object.keys(cursorSessions).length === 0) throw error
+      result = { sessions: [], agentError: String(error.message ?? error) }
+    }
     const queuedCount = new Map()
     for (const e of deferred) {
       queuedCount.set(e.sessionId, (queuedCount.get(e.sessionId) ?? 0) + 1)
     }
     const includeArchived = /^(1|true)$/i.test(query.get('includeArchived') ?? '')
-    const sessions = (result.sessions ?? []).map(s => ({
+    const devinSessions = (result.sessions ?? []).map(s => ({
       ...s,
       _busy: acp.busy.has(s.sessionId),
+      _sweBusy: acp.sweBusy.has(s.sessionId),
+      _model: acp.models.get(s.sessionId)
+        ?? (typeof s.modelId === 'string' ? s.modelId : typeof s.model === 'string' ? s.model : null),
       _queued: queuedCount.get(s.sessionId) ?? 0,
       _archived: archived[s.sessionId] !== undefined,
     }))
+    const cursorRows = query.get('cursor') ? [] : Object.entries(cursorSessions)
+      .filter(([, row]) => !params.cwd || row?.cwd === params.cwd)
+      .map(([sessionId, row]) => ({ ...row, sessionId, provider: 'cursor',
+        _busy: cursorAcp.busy.has(rawSessionId(sessionId)), _queued: 0,
+        _archived: archived[sessionId] !== undefined }))
+    const sessions = [...cursorRows, ...devinSessions]
     return { ...result, sessions: includeArchived ? sessions : sessions.filter(s => !s._archived) }
   },
 
@@ -1239,16 +1415,29 @@ const routes = {
   },
 
   'POST /api/sessions/new': async (req) => {
-    await acp.ensure()
-    const { cwd } = await readBody(req)
-    return acp.newSession(requireDir(cwd))
+    const { cwd, provider } = await readBody(req)
+    if (provider !== undefined && !['devin', 'cursor'].includes(provider)) throw httpError(400, 'unknown provider')
+    const dir = requireDir(cwd)
+    const host = provider === 'cursor' ? cursorAcp : acp
+    await host.ensure()
+    const created = await host.newSession(dir)
+    if (host === acp) return created
+    const sessionId = publicSessionId('cursor', created.sessionId)
+    cursorSessions[sessionId] = { cwd: dir, title: '(新会话)', updatedAt: new Date().toISOString() }
+    let persistenceWarning
+    try { saveCursorSessions() } catch (error) { persistenceWarning = `Cursor 会话索引保存失败：${error.message}` }
+    return { ...created, sessionId, provider: 'cursor', ...(persistenceWarning ? { persistenceWarning } : {}) }
   },
 
   'POST /api/sessions/load': async (req) => {
-    await acp.ensure()
     const { sessionId, cwd } = await readBody(req)
-    if (typeof sessionId !== 'string' || sessionId.length === 0) throw httpError(400, 'sessionId required')
-    const result = await acp.ensureLoaded(sessionId, requireDir(cwd))
+    const { host, raw } = targetSession(sessionId)
+    const dir = requireDir(cwd)
+    const result = await host.ensureLoaded(raw, dir)
+    if (host === cursorAcp && !cursorSessions[sessionId]) {
+      cursorSessions[sessionId] = { cwd: dir, title: sessionId, updatedAt: new Date().toISOString() }
+      saveCursorSessions()
+    }
     return result ?? { ok: true, alreadyLoaded: true }
   },
 
@@ -1259,7 +1448,7 @@ const routes = {
    */
   'GET /api/history': (_req, query) => {
     const sessionId = query.get('sessionId')
-    const history = sessionId === null ? undefined : acp.histories.get(sessionId)
+    const history = sessionId === null ? undefined : targetSession(sessionId).host.histories.get(rawSessionId(sessionId))
     if (history === undefined) return { totalTurns: 0, from: 0, to: 0, turns: [], truncated: false }
     const turns = splitTurns(history.updates)
     const total = turns.length
@@ -1274,9 +1463,21 @@ const routes = {
   },
 
   'POST /api/sessions/delete': async (req) => {
-    await acp.ensure()
     const { sessionId } = await readBody(req)
-    if (typeof sessionId !== 'string' || sessionId.length === 0) throw httpError(400, 'sessionId required')
+    const { host, raw } = targetSession(sessionId)
+    if (host === cursorAcp) {
+      if (host.busy.has(raw)) throw httpError(409, 'Cursor 回合运行中，请结束后再从列表移除')
+      // Cursor ACP exposes new/load, but no delete. Remove only Lite's local row.
+      delete cursorSessions[sessionId]
+      saveCursorSessions()
+      host.loaded.delete(raw)
+      host.histories.delete(raw)
+      host.configBySession.delete(raw)
+      if (archived[sessionId] !== undefined) { delete archived[sessionId]; saveArchive() }
+      host.emit({ kind: 'session-archived', sessionId: raw, archived: false })
+      return { ok: true, localOnly: true }
+    }
+    await acp.ensure()
     await acp.request('session/delete', { sessionId })
     acp.loaded.delete(sessionId)
     acp.histories.delete(sessionId)
@@ -1294,25 +1495,36 @@ const routes = {
   },
 
   'POST /api/sessions/mode': async (req) => {
-    await acp.ensure()
     const { sessionId, modeId, cwd } = await readBody(req)
     if (typeof sessionId !== 'string' || typeof modeId !== 'string') throw httpError(400, 'sessionId and modeId required')
-    if (cwd !== undefined) await acp.ensureLoaded(sessionId, requireDir(cwd))
-    return acp.request('session/set_mode', { sessionId, modeId })
+    const { host, raw } = targetSession(sessionId)
+    await host.ensure()
+    if (cwd !== undefined) await host.ensureLoaded(raw, requireDir(cwd))
+    return host.request('session/set_mode', { sessionId: raw, modeId })
   },
 
   'POST /api/sessions/config': async (req) => {
-    await acp.ensure()
     const { sessionId, configId, value, cwd } = await readBody(req)
     if (typeof sessionId !== 'string' || typeof configId !== 'string' || value === undefined) {
       throw httpError(400, 'sessionId, configId and value required')
     }
-    if (cwd !== undefined) await acp.ensureLoaded(sessionId, requireDir(cwd))
-    return acp.request('session/set_config_option', { sessionId, configId, value })
+    const { host, raw } = targetSession(sessionId)
+    await host.ensure()
+    if (cwd !== undefined) await host.ensureLoaded(raw, requireDir(cwd))
+    if (host === acp && configId === 'model') {
+      const kind = devinModelKind(value, acp.modelChoices.get(raw)?.get(value))
+      if (!['swe', 'other'].includes(kind)) throw httpError(422, '此模型已被隐藏；仅可选择 SWE、Sonnet 5.5 或 Opus 5.5')
+    }
+    const result = await host.request('session/set_config_option', { sessionId: raw, configId, value })
+    if (host === acp && configId === 'model') acp.models.set(raw, value)
+    const previous = host.configBySession.get(raw)
+    if (Array.isArray(previous)) host.configBySession.set(raw, previous.map(option =>
+      option?.id === configId ? { ...option, currentValue: value } : option))
+    if (host === acp) acp.rememberConfig(raw, result?.configOptions)
+    return host === acp ? { ...result, configOptions: visibleDevinConfigOptions(result?.configOptions) } : result
   },
 
   'POST /api/prompt': async (req) => {
-    await acp.ensure()
     const { sessionId, cwd, text, images, clientMessageId } = await readBody(req)
     const imgs = Array.isArray(images)
       ? images.filter(i => typeof i?.data === 'string' && typeof i?.mimeType === 'string').slice(0, 8)
@@ -1321,10 +1533,38 @@ const routes = {
       throw httpError(400, 'sessionId and text or images required')
     }
     const dir = requireDir(cwd)
+    const { host, raw } = targetSession(sessionId)
+    if (host === cursorAcp) {
+      await host.ensureLoaded(raw, dir)
+      const count = (host.busy.get(raw) ?? 0) + 1
+      host.busy.set(raw, count)
+      if (count === 1) host.emit({ kind: 'busy', sessionId: raw, busy: true })
+      const record = cursorSessions[sessionId]
+      if (record) {
+        record.updatedAt = new Date().toISOString()
+        if (!record.title || record.title === '(新会话)') record.title = (text ?? '').trim().split(/\r?\n/)[0].slice(0, 80) || '(新会话)'
+        try { saveCursorSessions() } catch (error) { log('cursor session index write failed:', error.message) }
+      }
+      const echo = { text: text ?? '', buf: '', images: imgs.length }
+      void host.prompt(raw, dir, text ?? '', imgs, true, echo).then(result => {
+        host.emit({ kind: 'prompt-done', sessionId: raw, clientMessageId, stopReason: result?.stopReason })
+      }).catch(error => {
+        host.emit({ kind: 'prompt-done', sessionId: raw, clientMessageId, error: String(error.message ?? error) })
+      }).finally(() => {
+        host.dropEcho(raw, echo)
+        const remaining = (host.busy.get(raw) ?? 1) - 1
+        if (remaining <= 0) { host.busy.delete(raw); host.emit({ kind: 'busy', sessionId: raw, busy: false }) }
+        else host.busy.set(raw, remaining)
+      })
+      return { started: true }
+    }
+    await acp.ensure()
+    await acp.ensureLoaded(sessionId, dir)
     // The browser's explicit send bypasses older deferred work. A new active
     // session still needs a free slot; an already running session can be
     // interjected without increasing the active session count.
     const entry = { sessionId, cwd: dir, text: text ?? '', images: imgs, committed: false,
+      model: acp.models.get(sessionId),
       attempts: 0, queuedAt: Date.now(), lastError: null, state: 'queued', clientMessageId,
       source: 'gui', priority: true }
     // The prompt resolves when the turn ends — potentially minutes later.
@@ -1333,7 +1573,7 @@ const routes = {
       entry.attempts++
       void dispatchPrompt(entry)
       return { started: true }
-    })
+    }, acp.models.get(sessionId))
   },
 
   /**
@@ -1346,6 +1586,7 @@ const routes = {
    */
   'POST /api/bridge/turn/start': async (req) => {
     const { sessionId: requestedSid, cwd, text, images, model, modeId, clientTurnId, clientMessageId, priority } = await readBody(req)
+    if (isCursorSession(requestedSid)) throw httpError(400, 'Codex bridge accepts Devin sessions only')
     if (typeof clientTurnId === 'string' && clientTurnIds.has(clientTurnId)) {
       const turn = bridgeTurns.get(clientTurnIds.get(clientTurnId))
       if (turn !== undefined) return { ...turnView(turn), deduped: true }
@@ -1357,6 +1598,9 @@ const routes = {
       : []
     if (typeof text !== 'string' || (text.trim() === '' && imgs.length === 0)) throw httpError(400, 'text or images required')
     const modelId = typeof model === 'string' && model !== '' ? model : 'swe-2-high'
+    if (!['swe', 'other'].includes(devinModelKind(modelId))) {
+      throw httpError(422, '仅可使用 SWE、Sonnet 5.5 或 Opus 5.5')
+    }
     const mode = typeof modeId === 'string' && modeId !== '' ? modeId : 'bypass'
     return withCapacityAdmission(requestedSid, async () => {
     await acp.ensure()
@@ -1375,6 +1619,7 @@ const routes = {
       throw httpError(422, `model not offered by this agent: ${modelId}`)
     }
     const setResult = await acp.request('session/set_config_option', { sessionId, configId: 'model', value: modelId })
+    acp.models.set(sessionId, modelId)
     await acp.request('session/set_mode', { sessionId, modeId: mode })
     autoApproveSessions.add(sessionId)
     // Read the model evidence AFTER the set succeeded: if the agent echoes
@@ -1387,6 +1632,7 @@ const routes = {
     const turn = newBridgeTurn({ clientTurnId, sessionId })
     const entry = {
       sessionId, cwd: dir, text, images: imgs, committed: false, attempts: 0,
+      model: modelId,
       queuedAt: Date.now(), lastError: null, state: 'queued',
       turnId: turn.turnId, clientMessageId, source: 'bridge',
       priority: priority === true && typeof requestedSid === 'string' && requestedSid !== '',
@@ -1405,7 +1651,7 @@ const routes = {
       ...(clientMessageId !== undefined ? { clientMessageId } : {}),
       ...(typeof clientTurnId === 'string' ? { clientTurnId } : {}),
     }
-    })
+    }, modelId)
   },
 
   /**
@@ -1511,7 +1757,7 @@ const routes = {
       log(`manually dispatching deferred prompt for ${entry.sessionId} (attempt ${entry.attempts})`)
       void dispatchPrompt(entry)
       return { started: true, queueId }
-    })
+    }, entry.model ?? 'swe-2-high')
   },
 
   'GET /api/capacity': async () => {
@@ -1543,10 +1789,11 @@ const routes = {
   },
 
   'POST /api/cancel': async (req) => {
-    await acp.ensure()
     const { sessionId } = await readBody(req)
-    if (typeof sessionId !== 'string') throw httpError(400, 'sessionId required')
-    acp.notify('session/cancel', { sessionId })
+    const { host, raw } = targetSession(sessionId)
+    await host.ensure()
+    host.notify('session/cancel', { sessionId: raw })
+    if (host === cursorAcp) return { ok: true }
     const dropped = deferred.length
     deferred = deferred.filter(e => e.sessionId !== sessionId)
     if (deferred.length !== dropped) { saveQueue(); acp.emit({ kind: 'queue', pending: deferred.length }) }
@@ -1555,14 +1802,24 @@ const routes = {
   },
 
   'POST /api/permission': async (req) => {
-    await acp.ensure()
     const { requestId, optionId, cancel } = await readBody(req)
     if (typeof requestId !== 'string') throw httpError(400, 'requestId required')
+    const host = requestId.startsWith(CURSOR_PREFIX) ? cursorAcp : acp
+    await host.ensure()
     const outcome = cancel === true
       ? { outcome: { outcome: 'cancelled' } }
       : { outcome: { outcome: 'selected', optionId } }
-    if (!acp.answer(requestId, outcome)) throw httpError(404, 'permission request not pending')
-    acp.emit({ kind: 'permission-done', requestId })
+    if (!host.answer(rawSessionId(requestId), outcome)) throw httpError(404, 'permission request not pending')
+    host.emit({ kind: 'permission-done', requestId })
+    return { ok: true }
+  },
+
+  'POST /api/cursor/respond': async (req) => {
+    const { requestId, result } = await readBody(req)
+    if (typeof requestId !== 'string' || !requestId.startsWith(CURSOR_PREFIX)
+        || !result || typeof result !== 'object') throw httpError(400, 'Cursor requestId and result required')
+    if (!cursorAcp.answer(rawSessionId(requestId), result)) throw httpError(404, 'Cursor request not pending')
+    cursorAcp.emit({ kind: 'cursor-request-done', requestId })
     return { ok: true }
   },
 
@@ -1635,7 +1892,8 @@ const routes = {
    */
   'GET /api/session-images': async (_req, query) => {
     const sid = query.get('sessionId') ?? ''
-    const history = acp.histories.get(sid)
+    const { host, raw } = targetSession(sid)
+    const history = host.histories.get(raw)
     if (history === undefined) throw httpError(404, 'session not loaded in this process')
     const seen = new Set()
     const images = []
@@ -1695,8 +1953,9 @@ const routes = {
    */
   'GET /api/bridge-text': async (_req, query) => {
     const sid = query.get('sessionId') ?? ''
-    const history = acp.histories.get(sid)
-    const cwd = acp.loaded.get(sid)
+    const { host, raw } = targetSession(sid)
+    const history = host.histories.get(raw)
+    const cwd = host.loaded.get(raw)
     if (!history || !cwd) throw httpError(404, 'session not loaded in this process')
     return { text: bridgeText(sid, cwd, history.updates), cwd }
   },
@@ -1892,12 +2151,14 @@ server.on('error', (error) => {
  * is exactly the case spawn()'s stale-pid reaping covers on the next launch.
  */
 function shutdownChild() {
-  const pid = acp.child?.pid
-  if (pid === undefined) return
-  killTree(pid)
-  try {
-    if (readFileSync(PID_FILE, 'utf8').trim() === String(pid)) unlinkSync(PID_FILE)
-  } catch { /* marker already gone */ }
+  for (const [host, pidFile] of [[acp, PID_FILE], [cursorAcp, CURSOR_PID_FILE]]) {
+    const pid = host.child?.pid
+    if (pid === undefined) continue
+    killTree(pid)
+    try {
+      if (readFileSync(pidFile, 'utf8').trim() === String(pid)) unlinkSync(pidFile)
+    } catch { /* marker already gone */ }
+  }
 }
 process.on('exit', shutdownChild)
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) {

@@ -90,16 +90,23 @@
           </button>
         </div>
       </div>
-      <div class="composer-foot">Devin Lite 通过本机 Devin CLI 运行 · 结果请自行核对</div>
+      <div id="composerFoot" class="composer-foot">当前会话通过本机 Devin CLI 运行 · 结果请自行核对</div>
     </div>
   </section>
 </div>
 <dialog id="newSessionDialog" class="workspace-dialog" aria-labelledby="newSessionTitle">
   <div class="workspace-dialog-head">
-    <div><h2 id="newSessionTitle">新建会话</h2><p>选择一个工作区，Devin 将在该目录中工作。</p></div>
+    <div><h2 id="newSessionTitle">新建会话</h2><p id="newSessionHint">选择智能体和工作区。</p></div>
     <button id="newSessionClose" class="icon-btn" type="button" aria-label="关闭新建会话窗口">×</button>
   </div>
   <div class="workspace-dialog-body">
+    <section aria-label="选择智能体">
+      <h3>智能体</h3>
+      <select id="newSessionProvider" class="provider-select" aria-label="新会话智能体">
+        <option value="devin">Devin</option>
+        <option value="cursor">Cursor CLI</option>
+      </select>
+    </section>
     <section aria-label="已有工作区">
       <h3>已有工作区</h3>
       <div id="knownWorkspaces" class="known-workspaces"></div>

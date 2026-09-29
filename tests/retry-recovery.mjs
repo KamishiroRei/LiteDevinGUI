@@ -178,6 +178,38 @@ async function run() {
   })
   check('unknown capacity fails closed before ACP prompt',
     unknownCapacity.status === 503 && lines(PROMPT_LOG).length === 0)
+  const loaded = await api('POST', '/api/sessions/load', { sessionId: 's1', cwd: WORK })
+  const offered = loaded.body?.configOptions?.find(o => o.id === 'model')?.options?.map(o => o.value) ?? []
+  const blockedModel = await api('POST', '/api/sessions/config', {
+    sessionId: 's1', cwd: WORK, configId: 'model', value: 'other-model',
+  })
+  check('Devin model list hides disallowed models and the API rejects them',
+    offered.includes('swe-2-high') && offered.includes('claude-sonnet-5.5')
+      && offered.includes('claude-opus-5.5') && !offered.includes('other-model')
+      && blockedModel.status === 422)
+  setState({ capacity: { active: 5, limit: 5 } })
+  const chooseSonnet = await api('POST', '/api/sessions/config', {
+    sessionId: 's1', cwd: WORK, configId: 'model', value: 'claude-sonnet-5.5',
+  })
+  const sonnetAtSweLimit = await api('POST', '/api/prompt', {
+    sessionId: 's1', cwd: WORK, text: 'sonnet-not-swe-capped',
+  })
+  await until(() => lines(PROMPT_LOG).some(row => row.text === 'sonnet-not-swe-capped'))
+  check('Sonnet 5.5 can start while SWE is at 5/5',
+    chooseSonnet.status === 200 && sonnetAtSweLimit.status === 200)
+  const chooseOpus = await api('POST', '/api/sessions/config', {
+    sessionId: 's1', cwd: WORK, configId: 'model', value: 'claude-opus-5.5',
+  })
+  const opusAtSweLimit = await api('POST', '/api/prompt', {
+    sessionId: 's1', cwd: WORK, text: 'opus-not-swe-capped',
+  })
+  await until(() => lines(PROMPT_LOG).some(row => row.text === 'opus-not-swe-capped'))
+  check('Opus 5.5 can start while SWE is at 5/5',
+    chooseOpus.status === 200 && opusAtSweLimit.status === 200)
+  await api('POST', '/api/sessions/config', {
+    sessionId: 's1', cwd: WORK, configId: 'model', value: 'swe-2-high',
+  })
+  writeFileSync(PROMPT_LOG, '')
   setState({ capacity: { active: 0, limit: 5 } })
 
   setState({ promptMode: 'hang' })

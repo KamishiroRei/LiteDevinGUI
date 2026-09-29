@@ -1,9 +1,10 @@
-"""Machine-wide Devin admission: five concurrent turns, retry every 300s."""
+"""Machine-wide SWE admission: five concurrent SWE turns, retry every 300s."""
 from __future__ import annotations
 import contextlib
 import ctypes
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -12,6 +13,9 @@ import urllib.parse
 
 POLL_SECONDS = 300
 MAX_CONCURRENCY = 5
+
+def is_swe_model(model):
+    return isinstance(model, str) and bool(re.search(r'(^|[^a-z])swe(?:[-_\s\d]|$)', model.lower()))
 # A registered subagent that stops heartbeating is treated as leaked residue:
 # it stops counting after this TTL but stays on disk for `swe_subagents.py sweep`.
 SUBAGENT_TTL_SECONDS = int(os.environ.get('DEVIN_SWE_SUBAGENT_TTL', '21600'))  # 6h
@@ -120,8 +124,14 @@ def lite_busy_sessions(base_url, fetch=None):
             sid = session.get('sessionId')
             if not isinstance(sid, str) or not isinstance(session.get('_busy'), bool):
                 raise RuntimeError('Missing session identity/activity from Devin Lite')
-            # A session seen busy anywhere in this snapshot stays reserved.
-            found[sid] = found.get(sid, False) or session['_busy']
+            # Cursor uses this same GUI but has a separate account and ACP.
+            if sid.startswith('cursor:'):
+                continue
+            model = session.get('_model')
+            # An explicit non-SWE model never consumes a SWE slot. Unknown
+            # model identity stays conservative for SWE admission only.
+            possible_swe = session.get('_sweBusy') is True or model is None or is_swe_model(model)
+            found[sid] = found.get(sid, False) or (session['_busy'] and possible_swe)
         cursor = page.get('nextCursor')
         if not cursor:
             return sorted(sid for sid, busy in found.items() if busy)
@@ -161,8 +171,10 @@ def summarize(rows, read_lite=lite_busy_sessions):
                               'model': None, 'classification': 'host_busy_session'})
             continue
         model = args[args.index('--model') + 1] if '--model' in args and args.index('--model') + 1 < len(args) else None
+        if model is not None and not is_swe_model(model):
+            continue
         roots.append({'pid': pid, 'parent_pid': parent_pid, 'model': model,
-                      'classification': 'swe' if model == 'swe-2-high' else 'unknown_or_other'})
+                      'classification': 'swe' if is_swe_model(model) else 'unknown_possible_swe'})
     return {'active': len(roots), 'sessions': roots,
             'unknown_or_other': sum(r['classification'] != 'swe' for r in roots)}
 

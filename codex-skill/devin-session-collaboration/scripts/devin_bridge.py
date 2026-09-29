@@ -570,13 +570,13 @@ You are participant {a['id']} ({a['name']}); your organizer is {a['parent_id']}.
  Your session workspace is {a['cwd']}; task-specific file scope and write ownership come from the task below. The bridge state is {state}, not the session workspace.
 Use this exact PowerShell command prefix: {base}
 All collaboration model turns use the resident Devin Lite ACP through this bridge. Do not launch a separate devin --print or devin acp for a peer task.
-Check live Devin capacity before creating a worker: {base} capacity. The shared limit is 5. If full, perform the work in your own Devin session; do not hand capacity overflow to Codex.
+Check live SWE capacity before creating a SWE worker: {base} capacity. The SWE-only limit is 5; Sonnet 5.5 and Opus 5.5 do not use those slots. If SWE is full, perform the work in your own Devin session; do not hand capacity overflow to Codex.
 Discover peers: {base} participants
 Read and mark your mailbox: {base} inbox --participant {aid} --read
 Send a note: {base} send --from {aid} --to <participant-id> --body-file <UTF-8-file>
 Send a request needing a new model turn: add --action to send; it queues for the recipient's original session.
 Create an independent SWE-2 High worker: {base} start --from {aid} --name <name> --cwd <stable-project-or-checkout-root> --prompt-file <UTF-8-task-file>. This creation command reports current active/available capacity and refuses at 5/5. Keep per-task folders in the task file and bridge state; use a task folder as cwd only when it is truly its own project/checkout or the user wants a separate workspace.
-For an internal run_subagent child, first reserve a slot: {subagents} reserve --parent <your-session-id> --title <task-title>. Launch only when admitted=true; on exit code 2, perform the work yourself. Release the returned reservation_id after the child completes or fails: {subagents} done --agent <reservation_id>. For a long task, refresh with heartbeat --agent <reservation_id>.
+For an internal SWE run_subagent child, first reserve a SWE slot: {subagents} reserve --parent <your-session-id> --title <task-title>. Launch only when admitted=true; on exit code 2, perform the work yourself. Release the returned reservation_id after the child completes or fails: {subagents} done --agent <reservation_id>. For a long task, refresh with heartbeat --agent <reservation_id>. Sonnet 5.5 and Opus 5.5 children do not reserve SWE slots.
 When you need a peer's reply in this model turn, send a normal note and wait for that peer: {base} wait --self {aid} --actor <peer-id> --timeout 600; then mark the returned message read with inbox --read. Wait only when the reply is needed, not while independent work remains.
 Report a finished result: {base} report --from {aid} --to <recipient-id> --summary-file <UTF-8-file> --artifact <path>
 {wake_instruction}

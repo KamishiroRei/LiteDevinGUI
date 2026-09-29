@@ -1,11 +1,11 @@
 # 当前执行者策略
 
-默认路由见[全局 AGENTS](../../../AGENTS.md)：Codex 自主判断是否委派，优先 Devin SWE-2 High；先读取桥梁 `capacity` 的当前占用，固定上限 5；并发满时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max。Devin 内部满额由原会话自行执行。Codex 保持正常工作职责；旧协作手册暂存为回退参考。
+默认路由见[全局 AGENTS](../../../AGENTS.md)：Codex 自主判断是否委派，优先 Devin SWE-2 High；先读取桥梁 `capacity` 的 SWE 占用，SWE 固定上限 5；SWE 满额时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max。Devin 内部 SWE 满额由原会话自行执行。Sonnet 5.5、Opus 5.5 不占 SWE 名额。Codex 保持正常工作职责；旧协作手册暂存为回退参考。
 
 | 职责 | 路由 |
 |---|---|
 | 正常任务推进：理解、判断、执行、协调、整合、必要验证与最终交付 | 当前 Codex 主控，保持自身模型；自主判断委派收益，无需用户点名；委派后轻量确认执行者正常启动即放手，有独立工作继续做，无事直接 idle，不持续监视或阻塞等待 |
-| 可委派的探查、问题分析、设计、代码/配置实现、验证及内部协调 | 优先经 Devin Lite 的单个 `devin acp` 使用 CLI 的 `swe-2-high`；Devin 并发已满时按任务难度选择 Codex 原生 `gpt-6-sol` 或 `gpt-6-luna`，均用 `max` |
+| 可委派的探查、问题分析、设计、代码/配置实现、验证及内部协调 | 优先经 Devin Lite 的单个 `devin acp` 使用 CLI 的 `swe-2-high`；SWE 5 条名额已满时按任务难度选择 Codex 原生 `gpt-6-sol` 或 `gpt-6-luna`，均用 `max` |
 | 受委派任务结果、需主控决策的阻塞/范围变化 | 回送原 Codex 聊天，由 Codex 按整体任务需要整合与继续推进 |
 | 涉及多模态的实战验收、动画/特效制作 | GPT-6；问题定位、设计和配套实现可委派 SWE-2 High，最后回到 GPT-6 实际检查 |
 | 用户单独指定的模型/档位 | 按该任务指令执行，不被默认路由覆盖 |

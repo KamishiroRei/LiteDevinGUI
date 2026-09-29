@@ -131,6 +131,17 @@ function addNote(text, cls = '') {
   scrollBottom()
   return div
 }
+const providerOf = (sessionId) => typeof sessionId === 'string' && sessionId.startsWith('cursor:') ? 'cursor' : 'devin'
+const providerName = (provider) => provider === 'cursor' ? 'Cursor' : 'Devin'
+function selectedDevinModelKind() {
+  const option = state.configOptions.find(o => o?.id === 'model' || o?.category === 'model')
+  const id = option?.currentValue
+  const label = option?.options?.find(o => o.value === id)?.name ?? ''
+  const text = `${id ?? ''} ${label}`.toLowerCase()
+  if (/(^|[^a-z])swe(?:[-_\s\d]|$)/.test(text)) return 'swe'
+  if (/(?:sonnet|opus)[^\n]{0,40}5[.\-_\s]?5(?:\b|$)/.test(text)) return 'other'
+  return 'unknown'
+}
 
 const IMAGE_BOOKS_KEY = 'devin-lite:image-refs'
 const IMAGE_PATH_RE = /\.(?:png|jpe?g|gif|webp|bmp|avif)$/i
@@ -358,14 +369,14 @@ async function refreshCapacity() {
     const available = Math.max(0, cap.limit - cap.active)
     badge.textContent = `${cap.active}/${cap.limit}`
     badge.classList.toggle('full', available === 0)
-    $('newBtn').title = `Devin 运行中 ${cap.active}/${cap.limit}，剩余 ${available}；满额时只能向运行中会话插话`
-    $('workspaceCapacity').textContent = `当前运行 ${cap.active}/${cap.limit} 条 Devin 会话`
+    $('newBtn').title = `SWE 运行中 ${cap.active}/${cap.limit}，剩余 ${available}；Sonnet 5.5、Opus 5.5 与 Cursor 不占用 SWE 名额`
+    if ($('newSessionProvider').value === 'devin') $('workspaceCapacity').textContent = `当前 SWE 运行 ${cap.active}/${cap.limit} 条；其他 Devin 模型不受此上限约束`
   } catch (err) {
     if (seq !== capacitySeq) return
     badge.textContent = '?/5'
     badge.classList.remove('full')
-    $('newBtn').title = `Devin 并发状态暂不可读：${err.message}`
-    $('workspaceCapacity').textContent = 'Devin 并发状态暂不可读'
+    $('newBtn').title = `SWE 并发状态暂不可读：${err.message}`
+    if ($('newSessionProvider').value === 'devin') $('workspaceCapacity').textContent = 'SWE 并发状态暂不可读；其他 Devin 模型仍可用'
   }
 }
 
@@ -527,6 +538,101 @@ function renderPermission(ev) {
 
 function imagePreviewUrl(ref) {
   return ref.objectUrl || (ref.path ? `/api/image-preview?path=${encodeURIComponent(ref.path)}` : '')
+}
+
+const cursorRequests = new Map()
+let cursorDialog
+function showCursorRequest() {
+  if (cursorDialog || cursorRequests.size === 0) return
+  const [requestId, ev] = cursorRequests.entries().next().value
+  const dialog = document.createElement('dialog')
+  cursorDialog = dialog
+  dialog.dataset.requestId = requestId
+  dialog.className = 'cursor-request-dialog'
+  const heading = document.createElement('h2')
+  heading.textContent = ev.method === 'cursor/create_plan' ? 'Cursor 请求批准方案' : 'Cursor 需要你的选择'
+  dialog.appendChild(heading)
+  const form = document.createElement('form')
+  form.addEventListener('submit', e => e.preventDefault())
+  dialog.appendChild(form)
+  const params = ev.params ?? {}
+  const questionFields = new Map()
+  if (ev.method === 'cursor/create_plan') {
+    const name = document.createElement('p')
+    name.textContent = params.name ?? params.overview ?? '请查看以下方案。'
+    const plan = document.createElement('pre')
+    plan.textContent = params.plan ?? ''
+    form.append(name, plan)
+  } else {
+    for (const q of params.questions ?? []) {
+      const field = document.createElement('fieldset')
+      questionFields.set(q.id, field)
+      const legend = document.createElement('legend')
+      legend.textContent = q.prompt ?? q.id
+      field.appendChild(legend)
+      for (const opt of q.options ?? []) {
+        const label = document.createElement('label')
+        const input = document.createElement('input')
+        input.type = q.allowMultiple ? 'checkbox' : 'radio'
+        input.name = `question-${q.id}`
+        input.value = opt.id
+        label.append(input, document.createTextNode(` ${opt.label ?? opt.id}`))
+        field.appendChild(label)
+      }
+      form.appendChild(field)
+    }
+  }
+  const actions = document.createElement('div')
+  actions.className = 'cursor-request-actions'
+  const button = (label, outcome) => {
+    const b = document.createElement('button')
+    b.type = 'button'
+    b.textContent = label
+    b.addEventListener('click', async () => {
+      let result
+      if (outcome === 'answered') {
+        const answers = (params.questions ?? []).map(q => ({
+          questionId: q.id,
+          selectedOptionIds: [...(questionFields.get(q.id)?.querySelectorAll('input:checked') ?? [])].map(x => x.value),
+        }))
+        if (answers.some(a => a.selectedOptionIds.length === 0)) { toast('请先回答每个问题，或选择跳过', 'warn'); return }
+        result = { outcome: { outcome, answers } }
+      } else result = { outcome: { outcome } }
+      try {
+        await api('POST', '/api/cursor/respond', { requestId, result })
+        cursorRequests.delete(requestId)
+        if (dialog.open) dialog.close()
+      } catch (error) { toast(`无法回复 Cursor：${error.message}`, 'error') }
+    })
+    actions.appendChild(b)
+  }
+  if (ev.method === 'cursor/create_plan') {
+    button('拒绝', 'rejected')
+    button('接受方案', 'accepted')
+  } else {
+    button('跳过', 'skipped')
+    button('提交选择', 'answered')
+  }
+  form.appendChild(actions)
+  dialog.addEventListener('cancel', e => e.preventDefault())
+  dialog.addEventListener('close', () => {
+    dialog.remove()
+    cursorDialog = undefined
+    showCursorRequest()
+  })
+  document.body.appendChild(dialog)
+  dialog.showModal()
+}
+function receiveCursorRequest(ev) {
+  if (!ev?.requestId || cursorRequests.has(ev.requestId)) return
+  cursorRequests.set(ev.requestId, ev)
+  showCursorRequest()
+}
+async function refreshCursorRequests() {
+  try {
+    const pending = await api('GET', '/api/agent/pending')
+    for (const ev of pending.cursor ?? []) receiveCursorRequest(ev)
+  } catch { /* reconnect will retry */ }
 }
 
 function hideImagePreview() { $('imageHoverPreview').hidden = true }
@@ -973,7 +1079,8 @@ function renameSession(s) {
 }
 
 async function deleteSession(s) {
-  if (!confirm(`删除会话 ${s.title || s.sessionId}？`)) return
+  const scope = providerOf(s.sessionId) === 'cursor' ? '从 Lite 列表移除（Cursor 原始会话保留）' : '删除会话'
+  if (!confirm(`${scope} ${s.title || s.sessionId}？`)) return
   try { await api('POST', '/api/sessions/delete', { sessionId: s.sessionId }) }
   catch (err) { toast(`删除失败：${err.message}`, 'error'); return }
   if (state.active?.sessionId === s.sessionId) clearActive()
@@ -1039,6 +1146,12 @@ function sessionRow(s) {
       <button class="icon-btn" data-op="menu" title="会话操作">${ICON.dots}</button>
     </div>`
   div.querySelector('.title').textContent = sessionTitle(s.sessionId, s.title)
+  if (providerOf(s.sessionId) === 'cursor') {
+    const tag = document.createElement('span')
+    tag.className = 'provider-tag'
+    tag.textContent = 'Cursor'
+    div.querySelector('.meta').prepend(tag)
+  }
   // Local busy is confirmed. Another client's lock is shown as running by
   // default, with the source of that inference visible to the user.
   const run = div.querySelector('.run')
@@ -1206,6 +1319,8 @@ function setActive(session, configOptions) {
   typingEl = null
   $('chatTitle').textContent = sessionTitle(session.sessionId, session.title) || '(无标题)'
   $('chatId').textContent = session.sessionId
+  $('composerFoot').textContent = `当前会话通过本机 ${providerName(providerOf(session.sessionId))} CLI 运行 · 结果请自行核对`
+  void refreshAgentStatus(providerOf(session.sessionId))
   $('input').disabled = false
   $('sendBtn').disabled = false
   loadDraft(session.sessionId)
@@ -1231,6 +1346,8 @@ function clearActive() {
   showEmptyState()
   $('chatTitle').textContent = '开始使用 Devin Lite'
   $('chatId').textContent = ''
+  $('composerFoot').textContent = '当前会话通过本机 Devin CLI 运行 · 结果请自行核对'
+  void refreshAgentStatus('devin')
   $('input').disabled = true
   $('sendBtn').disabled = true
   $('stopBtn').hidden = true
@@ -1255,7 +1372,7 @@ async function openSession(s) {
   } catch (err) {
     if (seq !== state.openSeq) return
     const msg = /already open in another process/i.test(err.message)
-      ? '该会话正被其他 devin 实例占用（桌面端 / 网页 / 另一个进程）。请先在原处关闭它，再在这里打开。'
+      ? `该会话正被其他 ${providerName(providerOf(s.sessionId))} 实例占用。请先在原处关闭，再在这里打开。`
       : `加载失败：${err.message}`
     addNote(msg, 'error')
     $('input').disabled = true
@@ -1363,6 +1480,15 @@ async function browseWorkspace(path = '', selectCurrent = false) {
   }
 }
 
+function updateNewSessionProvider() {
+  const cursor = $('newSessionProvider').value === 'cursor'
+  $('newSessionHint').textContent = cursor
+    ? 'Cursor CLI 将在所选工作区创建独立会话。首次使用需先完成 Cursor 登录。'
+    : 'Devin 将在所选工作区创建会话，继续使用当前的统一 ACP 入口。'
+  $('workspaceCapacity').textContent = cursor ? 'Cursor 会话不占用 Devin SWE 的 5 条并发名额' : ''
+  if (!cursor) void refreshCapacity()
+}
+
 function openNewSessionDialog(cwd) {
   const dialog = $('newSessionDialog')
   if (dialog.open) return
@@ -1370,6 +1496,8 @@ function openNewSessionDialog(cwd) {
   $('newSessionCreate').disabled = false
   $('newSessionCreate').textContent = '创建会话'
   const initial = cwd || state.active?.cwd || knownWorkspacePaths()[0] || ''
+  $('newSessionProvider').value = providerOf(state.active?.sessionId)
+  updateNewSessionProvider()
   $('workspacePath').value = initial
   renderKnownWorkspaces()
   dialog.showModal()
@@ -1393,9 +1521,10 @@ async function createNewSession() {
   $('newSessionCreate').disabled = true
   $('newSessionCreate').textContent = '创建中…'
   try {
-    const created = await api('POST', '/api/sessions/new', { cwd })
+    const created = await api('POST', '/api/sessions/new', { cwd, provider: $('newSessionProvider').value })
     // The server validates the directory before creating the session.
     setActive({ sessionId: created.sessionId, cwd, title: '(新会话)' }, created.configOptions)
+    if (created.persistenceWarning) toast(created.persistenceWarning, 'warn')
     ++workspaceBrowseSeq
     $('newSessionDialog').close()
     void refreshSessions()
@@ -1417,7 +1546,7 @@ async function bridgeSession(s) {
   try { bridge = await api('GET', `/api/bridge-text?sessionId=${encodeURIComponent(s.sessionId)}`) }
   catch (err) { addNote(`摘要生成失败：${err.message}`, 'warn') }
   try {
-    const created = await api('POST', '/api/sessions/new', { cwd: s.cwd })
+    const created = await api('POST', '/api/sessions/new', { cwd: s.cwd, provider: providerOf(s.sessionId) })
     setActive({ sessionId: created.sessionId, cwd: s.cwd, title: '(新会话)' }, created.configOptions)
     if (bridge?.text) $('input').value = bridge.text
     refreshSessions()
@@ -1433,11 +1562,14 @@ function renderOptionBar() {
     const sel = document.createElement('select')
     sel.title = opt.description ?? opt.name ?? opt.id
     sel.setAttribute('aria-label', opt.name ?? opt.id)
-    sel.innerHTML = `<option disabled>${esc(opt.name ?? opt.id)}</option>`
+    const selectedOffered = opt.options.some(o => o.value === opt.currentValue)
+    const placeholder = opt.id === 'model' || opt.category === 'model' ? '请选择允许的模型' : `请选择${opt.name ?? opt.id}`
+    sel.innerHTML = `<option value="" disabled${selectedOffered ? '' : ' selected'}>${esc(selectedOffered ? (opt.name ?? opt.id) : placeholder)}</option>`
       + opt.options.map(o => `<option value="${esc(o.value)}"${o.value === opt.currentValue ? ' selected' : ''}>${esc(o.name ?? o.value)}</option>`).join('')
     sel.addEventListener('change', () => {
       if (!state.active) return
       api('POST', '/api/sessions/config', { sessionId: state.active.sessionId, configId: opt.id, value: sel.value, cwd: state.active.cwd })
+        .then(() => { opt.currentValue = sel.value })
         .catch(err => addNote(`设置 ${opt.name ?? opt.id} 失败：${err.message}`, 'error'))
     })
     bar.appendChild(sel)
@@ -1903,12 +2035,16 @@ async function send() {
   const atts = [...state.attachments]
   // The live page may still be connected to an older server until its active
   // turns finish. Keep that page from starting a sixth turn in the meantime.
-  if (!wasBusy && (rawText || atts.length)) {
+  if (providerOf(sessionId) === 'devin' && selectedDevinModelKind() === 'unknown') {
+    toast('请先在模型栏选择 SWE、Sonnet 5.5 或 Opus 5.5', 'warn')
+    return
+  }
+  if (providerOf(sessionId) === 'devin' && selectedDevinModelKind() === 'swe' && !wasBusy && (rawText || atts.length)) {
     try {
       const cap = await api('GET', '/api/capacity')
       if (!Number.isInteger(cap.active) || cap.active < 0) throw new Error('并发状态不可读')
-      if (cap.active >= 5) { toast('Devin 已运行 5/5 条，请等待空位后发送', 'warn'); return }
-    } catch (err) { toast(`无法确认 Devin 并发状态：${err.message}`, 'error'); return }
+      if (cap.active >= 5) { toast('SWE 已运行 5/5 条，请等待空位后发送或改用 Sonnet 5.5、Opus 5.5', 'warn'); return }
+    } catch (err) { toast(`无法确认 SWE 并发状态：${err.message}`, 'error'); return }
     if (state.active?.sessionId !== sessionId || $('input').value.trim() !== rawText) return
   }
   // Migrate old draft attachments to path-only text before sending. No ACP
@@ -2052,32 +2188,47 @@ function setBusy(on) {
   }
 }
 
-function showAgentOnline(info) {
-  $('agentInfo').textContent = `${info?.name ?? 'devin'} ${info?.version ?? ''}`.trim()
+function showAgentOnline(info, provider = providerOf(state.active?.sessionId)) {
+  if (provider !== providerOf(state.active?.sessionId)) return
+  $('agentInfo').textContent = `${info?.name ?? providerName(provider)} ${info?.version ?? ''}`.trim()
   $('agentInfo').style.color = ''
   $('connectionDot').className = 'connection-dot online'
-  $('restartAgentBtn').title = '重启 Devin（运行中的回合不可重启）'
+  $('restartAgentBtn').title = `重启 ${providerName(provider)}（运行中的回合不可重启）`
 }
 
-function showAgentOffline(message) {
-  $('agentInfo').textContent = message ? `Devin 不可用：${message}` : 'Devin 未连接'
+function showAgentOffline(message, provider = providerOf(state.active?.sessionId)) {
+  if (provider !== providerOf(state.active?.sessionId)) return
+  $('agentInfo').textContent = message ? `${providerName(provider)} 不可用：${message}` : `${providerName(provider)} 未连接`
   $('agentInfo').style.color = 'var(--red)'
   $('connectionDot').className = 'connection-dot offline'
-  $('restartAgentBtn').title = '启动 Devin'
+  $('restartAgentBtn').title = `启动 ${providerName(provider)}`
+}
+
+async function refreshAgentStatus(provider = providerOf(state.active?.sessionId)) {
+  try {
+    const status = await api('GET', `/api/status?provider=${provider}`)
+    showAgentOnline(status.agentInfo, provider)
+  } catch (error) { showAgentOffline(error.message, provider) }
 }
 
 async function restartAgent() {
   const button = $('restartAgentBtn')
+  const provider = providerOf(state.active?.sessionId)
   button.disabled = true
   try {
-    const status = await api('POST', '/api/agent/restart')
-    showAgentOnline(status.agentInfo)
+    const status = await api('POST', '/api/agent/restart', { provider })
+    showAgentOnline(status.agentInfo, provider)
     await Promise.all([refreshSessions(), refreshQueue(), refreshCapacity()])
-    if (state.active) await openSession(state.active)
-    toast('Devin 已连接')
+    if (state.active && providerOf(state.active.sessionId) === provider) {
+      const current = { ...state.active }
+      saveDraft(current.sessionId)
+      state.active = undefined
+      await openSession(current)
+    }
+    toast(`${providerName(provider)} 已连接`)
   } catch (error) {
-    if (!error.message.includes('正在处理回合')) showAgentOffline(error.message)
-    toast(`无法重启 Devin：${error.message}`, 'error')
+    if (!error.message.includes('正在处理回合')) showAgentOffline(error.message, provider)
+    toast(`无法重启 ${providerName(provider)}：${error.message}`, 'error')
   } finally {
     button.disabled = false
   }
@@ -2088,8 +2239,9 @@ function connectEvents() {
   // SSE means the Lite host is reachable; only ACP initialization proves
   // that Devin itself is connected. Reconnect also revives a missing child.
   es.onopen = () => {
-    void api('GET', '/api/status').then(s => showAgentOnline(s.agentInfo)).catch(e => showAgentOffline(e.message))
+    void refreshAgentStatus()
     void refreshQueue() // a restarted host may now provide queue detail/actions
+    void refreshCursorRequests()
   }
   es.onmessage = (e) => {
     let ev
@@ -2119,6 +2271,11 @@ function connectEvents() {
       }
       case 'permission': if (ev.sessionId === state.active?.sessionId) renderPermission(ev); break
       case 'permission-done': state.stream.permEls.get(ev.requestId)?.remove(); state.stream.permEls.delete(ev.requestId); break
+      case 'cursor-request': receiveCursorRequest(ev); break
+      case 'cursor-request-done':
+        cursorRequests.delete(ev.requestId)
+        if (cursorDialog?.dataset.requestId === ev.requestId) cursorDialog.close()
+        break
       case 'prompt-deferred': {
         const row = state.sessions.find(s => s.sessionId === ev.sessionId)
         if (row) row._busy = state.busySessions.has(ev.sessionId)
@@ -2147,10 +2304,11 @@ function connectEvents() {
         break
       }
       case 'agent-down':
-        showAgentOffline(ev.message)
-        toast(`Devin CLI 已退出：${ev.message}。可点左下角重启按钮恢复。`, 'error')
+        showAgentOffline(ev.message, ev.provider ?? 'devin')
+        if ((ev.provider ?? 'devin') === providerOf(state.active?.sessionId))
+          toast(`${providerName(ev.provider)} CLI 已退出：${ev.message}。可点左下角重启按钮恢复。`, 'error')
         break
-      case 'agent-ready': showAgentOnline(ev.agentInfo); break
+      case 'agent-ready': showAgentOnline(ev.agentInfo, ev.provider ?? 'devin'); break
       case 'queue': void refreshQueue(); break
       default: break
     }
@@ -2228,6 +2386,7 @@ $('workspacePath').addEventListener('keydown', e => { if (e.key === 'Enter') { e
 $('workspaceLocate').addEventListener('click', () => { void browseWorkspace($('workspacePath').value.trim(), true) })
 $('workspaceUp').addEventListener('click', () => { void browseWorkspace(workspaceBrowserParent ?? '', true) })
 $('newSessionCreate').addEventListener('click', () => { void createNewSession() })
+$('newSessionProvider').addEventListener('change', updateNewSessionProvider)
 $('reloadBtn').addEventListener('click', () => { void Promise.all([refreshSessions(), refreshArchives()]) })
 $('restartAgentBtn').addEventListener('click', () => { void restartAgent() })
 $('moreBtn').addEventListener('click', () => refreshSessions(true))
@@ -2258,7 +2417,7 @@ $('transcript').addEventListener('scroll', () => {
   connectEvents()
   try {
     const status = await api('GET', '/api/status')
-    showAgentOnline(status.agentInfo)
+    showAgentOnline(status.agentInfo, 'devin')
     await Promise.all([refreshSessions(), refreshQueue(), refreshCapacity()])
     void refreshArchives()
     try {
@@ -2269,7 +2428,7 @@ $('transcript').addEventListener('scroll', () => {
       }
     } catch { localStorage.removeItem('devin-lite:active') }
   } catch (err) {
-    void Promise.all([refreshArchives(), refreshQueue(), refreshCapacity()]) // these work without ACP
+    void Promise.all([refreshSessions(), refreshArchives(), refreshQueue(), refreshCapacity()])
     showAgentOffline(err.message)
   }
 })()

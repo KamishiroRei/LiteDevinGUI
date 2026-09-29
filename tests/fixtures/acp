@@ -18,6 +18,13 @@ function state() {
 }
 
 const rl = readline.createInterface({ input: process.stdin })
+const modelOptions = (current) => [{ id: 'model', name: 'Model', currentValue: current,
+  options: [
+    { value: 'swe-2-high', name: 'SWE-2 High' },
+    { value: 'claude-sonnet-5.5', name: 'Sonnet 5.5' },
+    { value: 'claude-opus-5.5', name: 'Opus 5.5' },
+    { value: 'other-model', name: 'Other Model' },
+  ] }]
 rl.on('line', (line) => {
   let m
   try { m = JSON.parse(line) } catch { return }
@@ -32,10 +39,10 @@ rl.on('line', (line) => {
       respond({ result: {} })
       break
     case 'session/new':
-      respond({ result: { sessionId: `s-new-${Date.now()}` } })
+      respond({ result: { sessionId: `s-new-${Date.now()}`, configOptions: modelOptions(st.model ?? 'swe-2-high') } })
       break
     case 'session/load':
-      respond({ result: {} })
+      respond({ result: { configOptions: modelOptions(st.model ?? 'swe-2-high') } })
       break
     case 'session/list': {
       const all = st.sessions ?? []
@@ -51,8 +58,11 @@ rl.on('line', (line) => {
       respond({ result: {} })
       break
     case 'session/set_mode':
-    case 'session/set_config_option':
       respond({ result: {} })
+      break
+    case 'session/set_config_option':
+      fs.writeFileSync(STATE, JSON.stringify({ ...st, model: m.params?.value }))
+      respond({ result: { configOptions: modelOptions(m.params?.value) } })
       break
     case 'session/prompt': {
       const entry = {

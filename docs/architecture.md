@@ -4,9 +4,9 @@
 
 | 架构域 | 职责与流向 | 实现索引 |
 |---|---|---|
-| 进程与 ACP | `server.mjs` 持有一个 `devin acp`，将 ndjson JSON-RPC 转为 HTTP 与 SSE；浏览器与桥梁共享这个宿主 | 下文「ACP 与 HTTP」 |
+| 进程与 ACP | `server.mjs` 持有一个 `devin acp`，按需另启一个 Cursor `agent acp`；两者的 ndjson JSON-RPC 转为同一 HTTP 与 SSE，桥梁只使用 Devin | 下文「ACP 与 HTTP」 |
 | Codex 协作入口 | 桥梁 runner 经本机 HTTP 进入同一 ACP；任务文件正文作为 prompt，`cwd` 只作为会话工作区 | 下文「桥梁回合」；仓库 `codex-skill/devin-session-collaboration/scripts/devin_bridge.py`，同步安装到本机 Codex skills 目录 |
-| 会话与历史 | ACP 会话列表、装载和回放进入服务端缓存，浏览器按轮读取；本机服务另存归档元数据 | 下文「会话与历史」 |
+| 会话与历史 | Devin 列表与 Cursor 本地索引并列；各自 ACP 装载和回放进入服务端缓存，浏览器按轮读取；本机服务另存归档元数据 | 下文「会话与历史」 |
 | 延期发送 | 普通桥梁回合遭 Devin 并发拒绝时进入持久队列；主控插话直接投递并单独报告失败 | 下文「延期发送」 |
 | 网页交互 | `public/index.html` 提供语义结构，`public/app.js` 消费 REST/SSE，`public/app.css` 负责响应式主题 | 下文「网页交互」 |
 | 启动入口 | 静默和命令行两条本机启动路径 | `devin-lite.vbs`、`devin-lite.bat` |
@@ -15,7 +15,9 @@
 
 | 模块 | 功能 | 源码定位 |
 |---|---|---|
-| ACP 进程 | 认证、请求响应、主动权限请求和更新流 | `server.mjs` 的 `DevinAcp` |
+| ACP 进程 | 每个供应方一个子进程；认证、请求响应、主动权限请求和更新流 | `server.mjs` 的 `DevinAcp`、`acp`、`cursorAcp` |
+| Cursor 路由 | `cursor:` 公共会话 ID 映射为 Cursor 原始 ID；Cursor 会话索引持久化，桥梁与延期队列维持 Devin 路由 | `server.mjs` 的 `targetSession`、`cursorSessions`、`GET /api/sessions`、`POST /api/sessions/new|load|delete` |
+| Cursor 阻塞交互 | Cursor 的提问和方案请求保存在 ACP 宿主内，经 SSE/REST 展示并回传答复 | `server.mjs` 的 `DevinAcp.onAgentRequest`、`GET /api/agent/pending`、`POST /api/cursor/respond`；`public/app.js` 的 `showCursorRequest` |
 | 请求路由 | REST 端点、静态文件与 SSE 连接 | `server.mjs` 的 `routes`、`http.createServer` |
 | 桥梁权限 | 桥接会话使用 bypass，权限请求按允许选项自动应答；GUI 会话保持人工权限 UI | `server.mjs` 的 `autoApproveSessions`、`session/request_permission` 处理 |
 | 输入辅助 | 网页目录浏览与 Windows 文件/剪贴板选择；旧原生目录接口仍保留给兼容调用方 | `server.mjs` 的 `GET /api/browse`、`pickFolderNative`、`pickFileNative`、`clipboardFilesNative` |
@@ -25,12 +27,12 @@
 
 | 模块 | 功能 | 源码定位 |
 |---|---|---|
-| 会话装载 | 一个 ACP 进程装载多个会话，维护在途和回放状态 | `server.mjs` 的 `DevinAcp.ensureLoaded`、`DevinAcp.newSession` |
-| 新建会话 | 网页从已有会话/归档目录选工作区，也可浏览磁盘或输入绝对路径；服务端校验目录并在同一 ACP 创建会话 | `public/app.js` 的 `openNewSessionDialog`、`knownWorkspacePaths`、`browseWorkspace`、`createNewSession`；`server.mjs` 的 `GET /api/browse`、`POST /api/sessions/new` |
+| 会话装载 | 每个供应方的 ACP 各自装载多个会话，维护在途和回放状态 | `server.mjs` 的 `DevinAcp.ensureLoaded`、`DevinAcp.newSession` |
+| 新建会话 | 网页选 Devin 或 Cursor，并从已有目录、磁盘浏览器或路径输入选择工作区；服务端校验目录并交给对应 ACP | `public/app.js` 的 `openNewSessionDialog`、`updateNewSessionProvider`、`createNewSession`；`server.mjs` 的 `POST /api/sessions/new` |
 | 历史分页 | 将 ACP 更新分轮，按最新轮和更早轮返回 | `server.mjs` 的 `splitTurns`、`GET /api/history`；`public/app.js` 的 `renderHistoryTail`、`loadEarlier` |
 | 会话图片索引 | 从已装载会话正文发现仍存在的本机栅格图片路径，供当前会话 `@` 重用 | `server.mjs` 的 `RASTER_PATH_RE`、`GET /api/session-images`；`public/app.js` 的 `refreshSessionImages`、`imageRefsFor` |
 | 会话归档 | 服务端持久保存归档标记和标题/工作目录，独立列出与恢复；浏览器迁移旧本地记录 | `server.mjs` 的 `loadArchive`、`saveArchive`、`archiveView`、`GET /api/archived`、`POST /api/sessions/archive`、`POST /api/sessions/unarchive`；`public/app.js` 的 `refreshArchives`、`findLegacyArchiveMetadata`、`setArchived` |
-| 侧栏 | 工作目录分组、会话/归档切换、分页、搜索、菜单、当前选择与外窗占用状态推断；新会话按钮显示当前并发占用 | `public/app.js` 的 `refreshSessions`、`refreshCapacity`、`renderSessions`、`sessionRow`、`displayRunning`、`setSessionView`、`openRowMenu`、`setActive` |
+| 侧栏 | 工作目录分组、会话/归档切换、分页、搜索、菜单、当前选择与外窗占用状态推断；新会话按钮显示当前 SWE 并发占用 | `public/app.js` 的 `refreshSessions`、`refreshCapacity`、`renderSessions`、`sessionRow`、`displayRunning`、`setSessionView`、`openRowMenu`、`setActive` |
 | 浏览器本地状态 | 每会话草稿、图片标签与路径、未发送图片引用清理、显示名、明暗主题、侧栏开合及当前会话 | `public/app.js` 的 `drafts`、`imageBooks`、`pruneUnusedDraftImages`、`titleOverrides`、`setActive` 与初始化入口 |
 
 ## 桥梁回合
@@ -41,15 +43,16 @@
 | 主控插话 | 外部主控对已有会话发 action 时，桥梁把该 turn 标记为 `dispatching` 并启动独立跟踪进程，通过 `priority` 跳过普通 runner 和容量等待；网页主动发送亦直投，同一会话普通延期项仍按序 | `devin_bridge.py` 的 `send`、`spawn_controller_interjection`、`controller_interjection`、`run_lite_turn`；`server.mjs` 的 `POST /api/prompt`、`POST /api/bridge/turn/start` |
 | 状态与延期 | `GET /api/bridge/turn/status` 长等真实回合状态；并发拒绝沿用服务端延期队列；未知 host turn 明确 404 | `server.mjs` 的 `turnSet`、`turnView`、`deferPrompt`、`GET /api/bridge/turn/status` |
 | 安全取消 | 延期项只撤本项；在途回合同 session 有别的 prompt 时拒绝会话级取消 | `server.mjs` 的 `POST /api/bridge/turn/cancel` |
-| 桥梁持久协作 | 每任务 SQLite 保存 actor/邮箱/报告/验收、Lite host turn ID、容量准入和错误记录；`capacity` 与 `start` 显示固定 5 条上限及余量，满额新建失败；不启动另一个 Devin 模型进程 | 外部 `devin-session-collaboration/scripts/devin_bridge.py` 的 `capacity_view`、`make_actor`、`run_lite_turn`；`swe_capacity.py` |
+| 桥梁持久协作 | 每任务 SQLite 保存 actor/邮箱/报告/验收、Lite host turn ID、SWE 容量准入和错误记录；`capacity` 与当前 SWE-2 High `start` 显示 5 条 SWE 上限及余量；不启动另一个 Devin 模型进程 | 外部 `devin-session-collaboration/scripts/devin_bridge.py` 的 `capacity_view`、`make_actor`、`run_lite_turn`；`swe_capacity.py` |
 | Codex 原聊天回报 | Devin 侧直达命令先持久化 wake event；继承 Codex 宿主 pipe 的桥梁 runner 在本轮状态轮询中只投递新增事件一次。既有待发和遭拒事件保留供显式检查/重试 | `devin_bridge.py` 的 `submit_wake`、`wake_ids`、`deliver_new_wakes`、`dispatch_wake` |
-| Devin 内部子代理 | `run_subagent` 前在全局锁内预留一个名额；完成或失败释放，满额由父会话自行执行 | `codex-skill/devin-session-collaboration/scripts/swe_subagents.py` 的 `cmd_reserve`、`cmd_done` |
+| Devin 内部 SWE 子代理 | SWE `run_subagent` 前在全局锁内预留一个 SWE 名额；完成或失败释放，满额由父会话自行执行。Sonnet 5.5 和 Opus 5.5 不预留 SWE 名额 | `codex-skill/devin-session-collaboration/scripts/swe_subagents.py` 的 `cmd_reserve`、`cmd_done` |
 
 ## 延期发送
 
 | 模块 | 功能 | 源码定位 |
 |---|---|---|
-| 容量读取 | 调用共享 SWE 容量脚本，按固定 5 条上限给出当前可用名额；Lite 的网页发送、桥梁启动与手动重试按此准入，新忙碌会话到 5 条时拒绝第 6 条，容量不可读时停止派发；同一运行中会话插话不新增名额 | `server.mjs` 的 `capacitySnapshot`、`withCapacityAdmission`；`swe_capacity.py` 的 `limit` |
+| 容量读取 | 调用共享 SWE 容量脚本，按固定 5 条 SWE 上限给出可用名额；只有 SWE 的网页发送、桥梁启动与手动重试走此准入，Sonnet 5.5、Opus 5.5 与 Cursor 不占 SWE 名额；模型未知的 SWE 候选在准入前要求先选模型 | `server.mjs` 的 `devinModelKind`、`capacitySnapshot`、`withCapacityAdmission`；`swe_capacity.py` 的 `limit`、`lite_busy_sessions` |
+| 模型目录 | Devin ACP 配置选项只向网页显示 SWE、Sonnet 5.5、Opus 5.5，设置接口也拒绝其它模型；新会话默认值被隐藏时选一个允许的模型，已有会话保留原选择直至用户主动修改 | `server.mjs` 的 `devinModelKind`、`visibleDevinConfigOptions`、`DevinAcp.rememberConfig`、`POST /api/sessions/config`；`public/app.js` 的 `renderOptionBar` |
 | 错误期限 | 从 Devin 并发或配额错误提取重发时间，包括 `limit will reset in 1 minute`；解析不到时至少等 30 秒 | `server.mjs` 的 `parseRetryAfterMs`、`MIN_RETRY_MS` |
 | 队列状态 | 持久化待发送及发送中状态；重启后把发送中记录转为延期，至少等 30 秒再派发；逐条提供摘要、全文读取、手动重试与撤销，手动重试不可越过同会话较早项目 | `server.mjs` 的 `loadQueue`、`saveQueue`、`queueView`、`GET /api/queue`、`GET /api/queue/item`、`POST /api/queue/send|drop` |
 | 调度 | 到期与容量判断后重新进入同一会话 prompt | `server.mjs` 的 `deferPrompt`、`schedulePump`、`pumpDeferred`、`dispatchPrompt` |
@@ -60,7 +63,7 @@
 | 模块 | 功能 | 源码定位 |
 |---|---|---|
 | 页面骨架 | 工作区导航、会话内容、输入和状态区域 | `public/index.html` |
-| 工作区选择 | 新建会话弹窗显示已有工作区、目录浏览与路径输入，错误留在弹窗内；空会话页和侧栏按钮共用入口 | `public/index.html` 的 `newSessionDialog`；`public/app.js` 的 `renderKnownWorkspaces`、`browseWorkspace`、`createNewSession`；`public/app.css` 的 `.workspace-dialog` |
+| 工作区选择 | 新建会话弹窗显示智能体、已有工作区、目录浏览与路径输入，错误留在弹窗内；空会话页和侧栏按钮共用入口 | `public/index.html` 的 `newSessionDialog`；`public/app.js` 的 `updateNewSessionProvider`、`renderKnownWorkspaces`、`browseWorkspace`、`createNewSession`；`public/app.css` 的 `.workspace-dialog` |
 | ACP 连接状态 | SSE 连接仅表示 Lite 服务在线；ACP 初始化成功才显示 Devin 在线，左下角按钮可启动或重启 | `public/app.js` 的 `showAgentOnline`、`showAgentOffline`、`restartAgent`、`connectEvents` |
 | 页面主题 | 亮/暗主题、移动端布局、图标和状态样式 | `public/app.css`、`public/favicon.svg` |
 | 消息呈现 | ACP 语义更新转为回复、思考、工具、计划和权限卡片 | `public/app.js` 的 `renderUpdate`、`appendAgentText`、`toolCard`、`renderPermission` |

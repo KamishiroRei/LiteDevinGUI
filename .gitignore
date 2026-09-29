@@ -8,6 +8,8 @@ probe-*.log
 
 attachments/
 devin-lite.acp.pid
+cursor-lite.acp.pid
+cursor-sessions.json
 archived-sessions.json
 archived-sessions.json.corrupt-*
 deferred-prompts.json

@@ -9,7 +9,7 @@ description: Codex 与 Devin、以及 Devin 内部的自主会话通讯与协作
 
 ## 委派方式
 
-Codex 有 Devin 名额时把 SWE-2 High 当作异步自主 subagent 使用，通过本桥梁调用已经运行的 Devin Lite，由 Lite 的单个 `devin acp` 承载会话；并发已满时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max，具体路由见[当前执行者策略](../codex-thread-communication/references/executor-policy.md)。给 SWE 委派时简短提供目标、已知事实、可用材料和必要边界，由 SWE 自行决定实现路径；Luna 任务书按 [Codex 协作](../codex-thread-communication/SKILL.md) 给出明确方法和判据。Codex 轻量确认任务正常启动、无明显运行故障后即可放手；有其他独立工作照常推进，无事直接结束当前轮进入 idle，不持续监视、反复查询进度或阻塞等待。SWE 自主完成受委派职责，不设轻量模型式逐步检查或逐阶段报批；普通问题与获授权的同级自行解决，完成或真正需要主控处理时再回送。接收方可按分工是 Codex、Devin 同级或组织者，收到后按正常职责整合、验证和交付。
+Codex 有 SWE 名额时把 SWE-2 High 当作异步自主 subagent 使用，通过本桥梁调用已经运行的 Devin Lite，由 Lite 的单个 `devin acp` 承载会话；并发已满时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max，具体路由见[当前执行者策略](../codex-thread-communication/references/executor-policy.md)。给 SWE 委派时简短提供目标、已知事实、可用材料和必要边界，由 SWE 自行决定实现路径；Luna 任务书按 [Codex 协作](../codex-thread-communication/SKILL.md) 给出明确方法和判据。Codex 轻量确认任务正常启动、无明显运行故障后即可放手；有其他独立工作照常推进，无事直接结束当前轮进入 idle，不持续监视、反复查询进度或阻塞等待。SWE 自主完成受委派职责，不设轻量模型式逐步检查或逐阶段报批；普通问题与获授权的同级自行解决，完成或真正需要主控处理时再回送。接收方可按分工是 Codex、Devin 同级或组织者，收到后按正常职责整合、验证和交付。
 
 ## 会话工作区与任务目录
 
@@ -19,19 +19,17 @@ Codex 有 Devin 名额时把 SWE-2 High 当作异步自主 subagent 使用，通
 
 ## SWE 并发准入与满额等待
 
-用户规定 Devin 并发上限固定为 **5 条**。发布新执行者、普通续跑或 Devin 同级 action 触发下一轮，以及执行者自行派生任务前，都先检查当前实际运行总量；不能只数自己的任务库，也不能把历史会话数当运行数。**外部主控发给运行中的 Devin 会话的 action 是同会话插话**，直接通过 Lite 投递并单独追踪结果，不占一个新会话名额，也不等待普通队列；若目标会话尚未运行，仍须通过 Lite 的容量准入。`devin_bridge.py --state <任务状态目录> capacity` 返回 `active/limit/available`；`start` 自动预检并在结果中附带容量快照，满额时退出码 2、`admitted=false`，不创建 actor/turn。
+用户规定 **5 条并发上限只适用于 Devin SWE 模型**。Sonnet 5.5、Opus 5.5 不占 SWE 名额；Cursor CLI 使用另一套 ACP，也不占 Devin SWE 名额。Lite 的 Devin 模型选择栏仅显示 SWE、Sonnet 5.5、Opus 5.5，设置接口拒绝其它模型。已有会话打开时不擅自改模型；若原模型已隐藏，发新回合前须主动选择允许的模型。
 
-按实际执行会话计数：同一单轮Devin CLI与其ACP子进程合并为一个；跨项目SWE也占名额。独立ACP可能同时承载多个会话，不能按一个进程只记一个名额。已识别的Devin Lite宿主按实际监听端口读取全部分页会话列表，以sessionId去重计入每个busy会话；模型未知的busy会话同样占位。未知独立ACP或宿主列表不可达、字段不完整、分页未结束时，保留诊断并停止派发，不能按零或一个放行。其它不能确认活跃度的单轮/交互CLI保守占位。此检查只能证明本机可观察的调用与宿主报告状态；账号另有远端执行时，将已知占用纳入判断。Web宿主自行派发不持有本桥梁的准入锁，快照不是对全账号并发的绝对保证。
+当前协作桥梁 `start` 固定使用 `swe-2-high`，因此发布新 SWE 执行者、普通 SWE 续跑、SWE 同级 action 触发下一轮，以及派生 SWE 子代理前使用 `devin_bridge.py --state <任务状态目录> capacity` 查询 `active/limit/available`。满 5/5 时不创建新 SWE 执行者；Codex 可按任务难度改用 GPT-6 Sol Max 或 GPT-6 Luna Max，Devin 内部则由当前会话自己处理。向已经运行的同一 SWE 会话插话不新增会话名额。Sonnet 5.5、Opus 5.5 的网页回合不走 SWE 准入，也不因 SWE 满额而排队。
 
-会话内经 `run_subagent` 派生的 subagent **同样各占一个名额**（前台阻塞式与后台异步一样计）。已实测确认：subagent 不产生独立 `devin` 进程、`sessions.db` 会话行或 `/api/sessions` 条目，外部无法枚举，因此实行**派生方自报**：调用 `run_subagent` **之前**先运行 `python scripts/swe_subagents.py reserve --parent <自己的session/actor> --title <任务>`，该命令在全局准入锁内检查并登记，返回 `active_after/limit/available_after` 与 `reservation_id`。仅 `admitted=true` 才能启动；满额退出码 2 时由 Devin 当前会话自己执行，不转给 Codex，不排队派生。启动失败或子代理完成后立即 `done --agent <reservation_id>`；长时运行期间用 `heartbeat --agent <reservation_id>` 保活。旧 `register` 仅供已运行子代理的存量登记，不可作为新建前的预留。登记项带 `host_pid` 时宿主进程已死即不计；超过 `DEVIN_SWE_SUBAGENT_TTL`（默认6小时）未保活视为残留不计入但保留待 `sweep` 清理。不可观测不等于不占名额：禁止以不登记绕过上限。
+SWE 容量按实际并行执行数计：Lite 宿主对每个 busy 会话提供所选模型与 SWE 在途标记；扫描器排除 Cursor 和已知非 SWE 会话。独立 CLI 指定非 SWE 模型时不计入。模型身份缺失的占用为避免超发暂按可能的 SWE 保守占位，**只影响 SWE 准入**，不会阻止 Sonnet 5.5 或 Opus 5.5。独立 ACP 无法枚举、宿主分页或活动字段不可读时，SWE 准入明确失败；不能把不可读当零。此统计只覆盖本机可见执行，不能证明远端账号状态。
 
-达到上限或新增后将超限，桥梁持久保留已提交的待执行任务并进入`waiting_capacity`。后台执行器**每300秒（5分钟）重新查询运行总量**，有空位时在全局准入锁内重查并启动；没有空位继续等，不能超发或终止他人的任务。等待期间可响应取消，但取消检查不额外轮询容量。查运行数与启动须为同一跨任务互斥操作，避免多个发布者同时占同一空位。Codex 为新任务选择执行者时，在提交前按上限检查；已满则按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max，不创建等位的 Devin 执行者。发现已超限时停止新增，等待自然释放。
+Devin 内部只有派生 **SWE** 子代理时，才先运行 `python scripts/swe_subagents.py reserve --parent <自己的session/actor> --title <任务>`，成功预留后再调用 `run_subagent`；启动失败或完成后用 `done --agent <reservation_id>` 释放，长任务用 `heartbeat` 保活。Sonnet 5.5、Opus 5.5 子代理不做 SWE 预留。SWE 子代理未独立出现在 `devin` 进程或 Lite 会话列表中，因此必须由派生方自报；满额时父会话自行完成，不转给 Codex，也不排队派生。
 
-这是已提交 Devin 任务的异步容量调度，只轮询名额，不高频检查模型进度；Codex 新委派在预检满额时按任务难度选择 GPT-6 Sol Max 或 GPT-6 Luna Max。对仍在桥梁等位的任务，后台队列负责5分钟复查。父会话需新子任务而无名额时，自行处理或保存状态后释放自身执行轮，避免名额全被等待子任务的父会话占满。
+桥梁的普通 SWE 回合在跨任务锁内复核容量并投递到 Lite 的同一个 Devin ACP；已提交而遇满额的回合进入 `waiting_capacity`，后台每 300 秒复查，不高频重试。Lite 网页主动消息与外部主控 action 直接尝试发送，失败归到原消息或 turn，不暗中排队。普通桥梁回合遭后端并发或配额拒绝时，Lite 的延期队列按后端提示的重试时间加 5 秒安排，且至少等待 30 秒；没有明确期限时按 30 秒下限复查。非 SWE 回合如果因后端限制进入同一延期队列，也遵守后端重试期限，但不等 SWE 空位。网页可逐项查看、手动重试或取消；只读容量入口为 `GET /api/capacity`。
 
-普通桥梁回合启动前调用 `scripts/swe_capacity.py`，固定上限 5；本机用户 LocalAppData 下的全局锁跨任务库共享。Lite 路径在锁内调用 `/api/bridge/turn/start`，响应前 Lite 已保留 busy 计数，后续准入扫描将该会话计入；扫描包含归档中仍运行的会话。Lite 的网页发送、主控插话和手动重试也在服务端检查上限；同一运行中会话的插话不新增名额，容量未知时停止新会话派发。每轮 `capacity.json` 记录数量、上限、检查时间及满额时的下次检查时间。只读预检可用桥梁 `capacity` 命令或容量脚本；普通派发仍在锁内重查。已有会话的外部主控 action 走桥梁 `__inject` 直投，不会启动另一个模型进程；不要靠直接启动模型或不登记 subagent 规避名额。
-
-Devin Lite（`D:\devin-lite`）的网页主动消息和已有会话的外部主控 action 直接尝试投递；若后端拒绝，在原消息/桥梁 turn 上报告失败，不暗中排队。普通桥梁回合遇到并发/配额拒绝时进入延期队列，错误携带秒/分钟/小时或结构化期限时按 `期限+5s` 定时重发，最少等待 30 秒；无明确期限时按 30 秒容量复查节奏。网页默认展开所有 Lite 延期项，可逐条查看全文、手动重试或取消；接口为 `GET /api/queue|queue/item`、`POST /api/queue/send|drop`、`GET /api/capacity`。这只显示已经进入 Lite 的延期项；桥梁仍在 5 分钟容量等待中的普通回合记录在对应任务库的 `waiting_capacity`。该队列不持有全局准入锁，普通桥梁派发仍走锁内准入。
+同一单轮 Devin CLI 与其 ACP 子进程合并计一次；归档但仍 busy 的 SWE 会话仍占名额。检查与启动之间有竞争窗口，跨任务锁和 Lite 内部准入串行保证本机发起方不会同时抢同一名额。SWE 满额不终止别人的会话，不自动把旧延期消息投给新会话。
 
 ## 选择入口
 
