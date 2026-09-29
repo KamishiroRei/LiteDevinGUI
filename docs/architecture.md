@@ -7,6 +7,7 @@
 | 进程与 ACP | `server.mjs` 持有一个 `devin acp`，按需另启一个 Cursor `agent acp`；两者的 ndjson JSON-RPC 转为同一 HTTP 与 SSE，桥梁只使用 Devin | 下文「ACP 与 HTTP」 |
 | Codex 协作入口 | 桥梁 runner 经本机 HTTP 进入同一 ACP；任务文件正文作为 prompt，`cwd` 只作为会话工作区 | 下文「桥梁回合」；仓库 `codex-skill/devin-session-collaboration/scripts/devin_bridge.py`，同步安装到本机 Codex skills 目录 |
 | 会话与历史 | Devin 列表与 Cursor 本地索引并列；各自 ACP 装载和回放进入服务端缓存，浏览器按轮读取；本机服务另存归档元数据 | 下文「会话与历史」 |
+| 工作区技能 | Devin 会话创建/装载前，将最近的父级显式共享技能链接到当前工作区的原生技能目录；已有同名项目技能保持优先 | 下文「ACP 与 HTTP」；`workspace-skills.mjs` |
 | 延期发送 | 普通桥梁回合遭 Devin 并发拒绝时进入持久队列；主控插话直接投递并单独报告失败 | 下文「延期发送」 |
 | 网页交互 | `public/index.html` 提供语义结构，`public/app.js` 消费 REST/SSE，`public/app.css` 负责响应式主题 | 下文「网页交互」 |
 | 启动入口 | 静默和命令行两条本机启动路径 | `devin-lite.vbs`、`devin-lite.bat` |
@@ -22,6 +23,7 @@
 | 桥梁权限 | 桥接会话使用 bypass，权限请求按允许选项自动应答；GUI 会话保持人工权限 UI | `server.mjs` 的 `autoApproveSessions`、`session/request_permission` 处理 |
 | 输入辅助 | 网页目录浏览与 Windows 文件/剪贴板选择；旧原生目录接口仍保留给兼容调用方 | `server.mjs` 的 `GET /api/browse`、`pickFolderNative`、`pickFileNative`、`clipboardFilesNative` |
 | 生命周期 | 启动器经不触发 ACP 的健康探针复用现役 Lite；网页打开时单飞启动缺失的 ACP，初始化限时；ACP 退出时拒绝全部在途请求；闲置时可手动重启，忙碌时拒绝重启 | `server.mjs` 的 `DevinAcp.ensure`、`DevinAcp.teardown`、`DevinAcp.restart`、`GET /api/health`、`POST /api/agent/restart`、`shutdownChild`；`devin-lite.vbs` |
+| 技能注册 | 仅当父目录有 `.agents/AGENTS.md` 与 `.agents/skills` 时，扫描最近的共享技能目录；当前工作区缺失的技能以目录链接注册，失败作为 `skillWarning` 返回，不覆盖本地同名技能 | `workspace-skills.mjs` 的 `prepareWorkspaceSkills`；`server.mjs` 的 `DevinAcp.newSession`、`DevinAcp.ensureLoaded`；`public/app.js` 的 `createNewSession`、`openSession` |
 
 ## 会话与历史
 

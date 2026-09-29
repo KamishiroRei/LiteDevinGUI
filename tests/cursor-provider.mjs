@@ -63,6 +63,7 @@ async function stop() {
 
 try {
   copyFileSync(join(SOURCE, 'server.mjs'), join(WORK, 'server.mjs'))
+  copyFileSync(join(SOURCE, 'workspace-skills.mjs'), join(WORK, 'workspace-skills.mjs'))
   copyFileSync(join(SOURCE, 'tests', 'fixtures', 'acp'), join(WORK, 'acp'))
   writeFileSync(join(WORK, 'fake-state.json'), JSON.stringify({ sessions: [] }))
   writeFileSync(join(WORK, 'fake-cursor.ps1'),

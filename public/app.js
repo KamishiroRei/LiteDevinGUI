@@ -1365,6 +1365,7 @@ async function openSession(s) {
   try {
     const res = await api('POST', '/api/sessions/load', { sessionId: s.sessionId, cwd: s.cwd })
     if (seq !== state.openSeq) return // superseded by a newer switch
+    if (res.skillWarning) toast(res.skillWarning, 'warn')
     if (res.configOptions) { state.configOptions = res.configOptions; renderOptionBar() }
     await refreshSessionImages(s.sessionId, seq)
     if (seq !== state.openSeq) return
@@ -1524,6 +1525,7 @@ async function createNewSession() {
     const created = await api('POST', '/api/sessions/new', { cwd, provider: $('newSessionProvider').value })
     // The server validates the directory before creating the session.
     setActive({ sessionId: created.sessionId, cwd, title: '(新会话)' }, created.configOptions)
+    if (created.skillWarning) toast(created.skillWarning, 'warn')
     if (created.persistenceWarning) toast(created.persistenceWarning, 'warn')
     ++workspaceBrowseSeq
     $('newSessionDialog').close()
@@ -1548,6 +1550,7 @@ async function bridgeSession(s) {
   try {
     const created = await api('POST', '/api/sessions/new', { cwd: s.cwd, provider: providerOf(s.sessionId) })
     setActive({ sessionId: created.sessionId, cwd: s.cwd, title: '(新会话)' }, created.configOptions)
+    if (created.skillWarning) toast(created.skillWarning, 'warn')
     if (bridge?.text) $('input').value = bridge.text
     refreshSessions()
   } catch (err) { alert(`创建失败：${err.message}`) }

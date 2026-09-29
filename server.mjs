@@ -15,6 +15,7 @@ import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSy
 import { homedir } from 'node:os'
 import { join, resolve, isAbsolute, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { prepareWorkspaceSkills } from './workspace-skills.mjs'
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url))
 
@@ -521,6 +522,9 @@ class DevinAcp {
         configOptions: this.provider === 'devin' ? visibleDevinConfigOptions(options) : options,
       }
     }
+    const skillSetup = this.provider === 'devin' ? prepareWorkspaceSkills(cwd) : { linked: [], warning: '' }
+    if (skillSetup.linked.length) log(`registered ${skillSetup.linked.length} shared skills for ${cwd}`)
+    if (skillSetup.warning) log(skillSetup.warning)
     // Replay updates buffer for paging; a fresh buffer replaces a stale one.
     this.loading.add(sessionId)
     this.histories.set(sessionId, { updates: [], truncated: false })
@@ -528,7 +532,8 @@ class DevinAcp {
       const result = await this.withAuth(() => this.request('session/load', { sessionId, cwd, mcpServers: [] }))
       this.loaded.set(sessionId, cwd)
       this.rememberConfig(sessionId, result?.configOptions)
-      return this.provider === 'devin' ? { ...result, configOptions: visibleDevinConfigOptions(result?.configOptions) } : result
+      return this.provider === 'devin' ? { ...result, configOptions: visibleDevinConfigOptions(result?.configOptions),
+        ...(skillSetup.warning ? { skillWarning: skillSetup.warning } : {}) } : result
     } finally {
       this.loading.delete(sessionId)
       this.emit({ kind: 'history-ready', sessionId })
@@ -536,6 +541,9 @@ class DevinAcp {
   }
 
   async newSession(cwd) {
+    const skillSetup = this.provider === 'devin' ? prepareWorkspaceSkills(cwd) : { linked: [], warning: '' }
+    if (skillSetup.linked.length) log(`registered ${skillSetup.linked.length} shared skills for ${cwd}`)
+    if (skillSetup.warning) log(skillSetup.warning)
     const created = await this.withAuth(() => this.request('session/new', { cwd, mcpServers: [] }))
     this.loaded.set(created.sessionId, cwd)
     this.histories.set(created.sessionId, { updates: [], truncated: false })
@@ -557,7 +565,8 @@ class DevinAcp {
       option?.id === 'model' || option?.category === 'model'
         ? { ...option, currentValue: this.models.get(created.sessionId) } : option)
     this.configBySession.set(created.sessionId, configOptions)
-    return { ...created, configOptions: visibleDevinConfigOptions(configOptions) }
+    return { ...created, configOptions: visibleDevinConfigOptions(configOptions),
+      ...(skillSetup.warning ? { skillWarning: skillSetup.warning } : {}) }
   }
 
   async prompt(sessionId, cwd, text, images = [], commit = true, echo) {
@@ -1639,7 +1648,8 @@ const routes = {
     }
     if (!entry.priority && deferred.some(queued => queued.sessionId === sessionId)) {
       deferPrompt(entry, '同一会话中有更早的待发送消息')
-      return { ...turnView(turn), observedModel, modelEvidence, mode, busy: acp.busy.get(sessionId) ?? 0 }
+      return { ...turnView(turn), observedModel, modelEvidence, mode, busy: acp.busy.get(sessionId) ?? 0,
+        ...(created.skillWarning ? { skillWarning: created.skillWarning } : {}) }
     }
     entry.attempts++
     turn.attempts = entry.attempts
@@ -1648,6 +1658,7 @@ const routes = {
       turnId: turn.turnId, sessionId,
       observedModel, modelEvidence,
       mode, status: 'running', busy: acp.busy.get(sessionId) ?? 0,
+      ...(created.skillWarning ? { skillWarning: created.skillWarning } : {}),
       ...(clientMessageId !== undefined ? { clientMessageId } : {}),
       ...(typeof clientTurnId === 'string' ? { clientTurnId } : {}),
     }

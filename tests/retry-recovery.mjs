@@ -139,6 +139,7 @@ async function rejectedPrompt(text, errorMessage) {
 
 async function run() {
   copyFileSync(join(SOURCE_ROOT, 'server.mjs'), join(WORK, 'server.mjs'))
+  copyFileSync(join(SOURCE_ROOT, 'workspace-skills.mjs'), join(WORK, 'workspace-skills.mjs'))
   copyFileSync(join(FIXTURES, 'acp'), join(WORK, 'acp'))
   copyFileSync(join(FIXTURES, 'fake-capacity.py'), join(WORK, 'fake-capacity.py'))
   base = `http://127.0.0.1:${await freePort()}`
