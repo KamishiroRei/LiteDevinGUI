@@ -942,9 +942,12 @@ async function loadEarlier() {
     })
     const row = $('loadEarlier')
     const t = $('transcript')
-    // Keep a separator between the prepended page and what follows.
-    if (data.turns.length > 0 && row && row.nextSibling) turnSep(frag, data.to, st)
-    while (frag.firstChild) t.insertBefore(frag.firstChild, row ?? null)
+    // The control stays at the top. Insert after it, before the oldest
+    // rendered turn; inserting before the control places later pages in the
+    // middle of the transcript and makes the page boundary look skipped.
+    const firstRendered = row?.nextSibling ?? t.firstChild
+    if (data.turns.length > 0 && firstRendered) turnSep(frag, data.to, st)
+    while (frag.firstChild) t.insertBefore(frag.firstChild, firstRendered)
     state.earliestTurn = data.from
     renderLoadEarlier()
     t.scrollTop += t.scrollHeight - prevHeight // keep viewport anchored

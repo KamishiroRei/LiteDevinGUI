@@ -33,7 +33,7 @@
 | 会话装载 | 每个供应方的 ACP 各自装载多个会话，维护在途和回放状态 | `server.mjs` 的 `DevinAcp.ensureLoaded`、`DevinAcp.newSession` |
 | 外发正文与状态 | `commitDeferred` 将完整正文作为用户消息广播并写入本地日志；投递中、待发送、回合结束、失败、取消分别更新；装载时与 ACP 用户消息去重，缺项只补显示 | `server.mjs` 的 `commitDeferred`、`outboundStatus`、`DevinAcp.ensureLoaded`；`outbound-journal.mjs` 的 `record`、`setStatus`、`mergeReplay`；`public/app.js` 的 `setUserMessageMeta`、`message-status` 事件处理 |
 | 新建会话 | 网页选 Devin 或 Cursor，并从已有目录、磁盘浏览器或路径输入选择工作区；服务端校验目录并交给对应 ACP | `public/app.js` 的 `openNewSessionDialog`、`updateNewSessionProvider`、`createNewSession`；`server.mjs` 的 `POST /api/sessions/new` |
-| 历史分页 | 将 ACP 更新分轮，按最新轮和更早轮返回 | `server.mjs` 的 `splitTurns`、`GET /api/history`；`public/app.js` 的 `renderHistoryTail`、`loadEarlier` |
+| 历史分页 | 将 ACP 更新分轮返回；浏览器以最早已显示轮次为游标，始终在顶部加载控件与当前最早轮之间插入更早页，保持轮次连续有序 | `server.mjs` 的 `splitTurns`、`GET /api/history`；`public/app.js` 的 `renderHistoryTail`、`loadEarlier` |
 | 会话图片索引 | 从已装载会话正文发现仍存在的本机栅格图片路径，供当前会话 `@` 重用 | `server.mjs` 的 `RASTER_PATH_RE`、`GET /api/session-images`；`public/app.js` 的 `refreshSessionImages`、`imageRefsFor` |
 | 会话归档 | 服务端持久保存归档标记和标题/工作目录，独立列出与恢复；浏览器迁移旧本地记录 | `server.mjs` 的 `loadArchive`、`saveArchive`、`archiveView`、`GET /api/archived`、`POST /api/sessions/archive`、`POST /api/sessions/unarchive`；`public/app.js` 的 `refreshArchives`、`findLegacyArchiveMetadata`、`setArchived` |
 | 侧栏 | 工作目录分组、会话/归档切换、分页、搜索、菜单、当前选择与外窗占用状态推断；新会话按钮显示当前 SWE 并发占用 | `public/app.js` 的 `refreshSessions`、`refreshCapacity`、`renderSessions`、`sessionRow`、`displayRunning`、`setSessionView`、`openRowMenu`、`setActive` |
