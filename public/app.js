@@ -24,7 +24,7 @@ const state = {
   active: undefined,     // { sessionId, cwd, title }
   busy: false,
   busySessions: new Set(), // sessionIds with an in-flight prompt (stop button follows the session, not the page)
-  queueItems: [],       // persistent deferred prompts from /api/queue
+  queueItems: [],       // only prompts awaiting another send; active turns use the session running state
   queueActionsReady: false, // old host stays readable until it can safely restart
   queueExpanded: new Set(), // queueIds with full text open
   queueFullText: new Map(), // fetched only for expanded queue items
@@ -221,7 +221,6 @@ function showEmptyState() {
 }
 
 function queueStatus(entry) {
-  if (entry.state === 'sending') return '正在发送'
   const until = entry.retryAt ? new Date(entry.retryAt).getTime() - Date.now() : 0
   return until > 0 ? `约 ${Math.ceil(until / 1000)} 秒后重试` : '等待并发空位'
 }
@@ -249,7 +248,7 @@ function updateQueueBanner() {
   panel.hidden = items.length === 0
   if (!items.length) return
   const current = items.filter(entry => entry.sessionId === state.active?.sessionId).length
-  $('queueText').textContent = `待处理消息 ${items.length} 条${current ? ` · 当前会话 ${current} 条` : ''}${state.queueActionsReady ? '' : ' · 服务端待重启'}`
+  $('queueText').textContent = `待发送消息 ${items.length} 条${current ? ` · 当前会话 ${current} 条` : ''}${state.queueActionsReady ? '' : ' · 服务端待重启'}`
   $('queueText').title = state.queueActionsReady ? '' : '当前宿主仍在运行旧版接口；会话空闲并重启后可查看全文和手动重试'
   $('queueToggle').textContent = state.queueCollapsed ? '展开' : '收起'
   $('queueToggle').setAttribute('aria-expanded', String(!state.queueCollapsed))
@@ -309,10 +308,8 @@ function updateQueueBanner() {
     }
     if (session?.cwd) actions.append(queueButton('打开会话', () => openSession(session)))
     const pending = state.queueActionPending.has(entry.queueId)
-    if (entry.state === 'queued') {
-      actions.append(queueButton('立即重试', () => queueAction(entry.queueId, 'send'), pending || !state.queueActionsReady))
-      actions.append(queueButton('取消排队', () => queueAction(entry.queueId, 'drop'), pending))
-    }
+    actions.append(queueButton('立即重试', () => queueAction(entry.queueId, 'send'), pending || !state.queueActionsReady))
+    actions.append(queueButton('取消排队', () => queueAction(entry.queueId, 'drop'), pending))
     row.append(actions)
     list.append(row)
   }
@@ -338,7 +335,11 @@ async function refreshQueue() {
     const data = await api('GET', '/api/queue')
     if (seq !== queueRefreshSeq) return
     state.queueActionsReady = data.features?.item === true && data.features?.send === true
-    state.queueItems = Array.isArray(data.pending) ? data.pending : []
+    // Lite retains in-flight retry records until the ACP turn settles. They
+    // have already left the waiting queue; the transcript and running badge
+    // represent that turn, even when an older server includes them in pending.
+    state.queueItems = Array.isArray(data.pending)
+      ? data.pending.filter(entry => entry.state === 'queued') : []
     const ids = new Set(state.queueItems.map(e => e.queueId))
     for (const id of state.queueFullText.keys()) if (!ids.has(id)) { state.queueFullText.delete(id); state.queueExpanded.delete(id) }
     updateQueueBanner()
@@ -1054,12 +1055,11 @@ function sessionRow(s) {
     div.title = s.cwd ?? ''
   }
   div.querySelector('.time').textContent = fmtTime(s.updatedAt)
-  const waiting = state.queueItems.filter(e => e.sessionId === s.sessionId && e.state !== 'sending').length
-  const sending = state.queueItems.some(e => e.sessionId === s.sessionId && e.state === 'sending')
-  if (waiting > 0 || sending) {
+  const waiting = state.queueItems.filter(e => e.sessionId === s.sessionId).length
+  if (waiting > 0) {
     const badge = document.createElement('span')
     badge.className = 'queued-count'
-    badge.textContent = waiting > 0 ? `${waiting} 条排队` : '发送中'
+    badge.textContent = `${waiting} 条排队`
     div.querySelector('.meta').appendChild(badge)
   }
   div.querySelector('[data-op=menu]').addEventListener('click', (e) => { e.stopPropagation(); openRowMenu(e.currentTarget, s) })

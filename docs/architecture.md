@@ -53,7 +53,7 @@
 | 错误期限 | 从 Devin 并发或配额错误提取重发时间，包括 `limit will reset in 1 minute`；解析不到时至少等 30 秒 | `server.mjs` 的 `parseRetryAfterMs`、`MIN_RETRY_MS` |
 | 队列状态 | 持久化待发送及发送中状态；重启后把发送中记录转为延期，至少等 30 秒再派发；逐条提供摘要、全文读取、手动重试与撤销，手动重试不可越过同会话较早项目 | `server.mjs` 的 `loadQueue`、`saveQueue`、`queueView`、`GET /api/queue`、`GET /api/queue/item`、`POST /api/queue/send|drop` |
 | 调度 | 到期与容量判断后重新进入同一会话 prompt | `server.mjs` 的 `deferPrompt`、`schedulePump`、`pumpDeferred`、`dispatchPrompt` |
-| 状态显示 | 默认展开全局队列，逐项显示来源、会话、内容、原因、倒计时、尝试次数及操作；侧栏计数随队列更新 | `public/app.js` 的 `connectEvents`、`refreshQueue`、`updateQueueBanner`、`queueAction` |
+| 状态显示 | 从队列快照筛出仍等待重试的项目，逐项显示来源、会话、内容、原因、倒计时、尝试次数及操作；已投递但未结束的回合由会话运行状态表示，不计入待发送数 | `public/app.js` 的 `refreshQueue`、`updateQueueBanner`、`sessionRow`、`connectEvents` |
 
 ## 网页交互
 
